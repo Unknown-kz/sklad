@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f766e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Склад">
+  <title>Склад</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <h1 id="title">Склад</h1>
+    <span id="net" class="net"></span>
+  </header>
+
+  <main>
+    <!-- Первый экран: открыть магазин или присоединиться -->
+    <section id="v-start" class="view on">
+      <div class="hero">
+        <img src="icons/icon-192.png" alt="" width="64" height="64">
+        <p>Товары, цены и остатки — у вас и у тех, кому вы дали код</p>
+      </div>
+      <div class="card">
+        <div class="seg">
+          <button type="button" data-mode="open" class="on">Открыть магазин</button>
+          <button type="button" data-mode="join">Присоединиться</button>
+        </div>
+        <form id="f-start">
+          <label>Ваше имя
+            <input name="name" required maxlength="40" placeholder="Например, Асан" autocomplete="given-name">
+          </label>
+          <label class="only-open">Название магазина
+            <input name="shopName" maxlength="60" placeholder="Например, Береке" autocomplete="off">
+          </label>
+          <label class="only-join">Код магазина (6 символов)
+            <input name="code" maxlength="7" placeholder="K7M2QX" autocapitalize="characters" autocomplete="off" class="code-input">
+          </label>
+          <button class="btn primary" type="submit">Открыть магазин</button>
+          <p class="err" id="start-err"></p>
+        </form>
+      </div>
+      <button type="button" class="link" id="restore-open">Уже пользовались на другом телефоне? Войти по ключу</button>
+    </section>
+
+    <!-- Мой магазин: товары -->
+    <section id="v-products" class="view">
+      <div class="toolbar">
+        <input id="q" type="search" placeholder="Поиск товара…" autocomplete="off">
+        <button class="btn primary" id="add-product" type="button">+ Товар</button>
+      </div>
+      <div class="stats" id="p-stats"></div>
+      <ul class="list" id="p-list"></ul>
+    </section>
+
+    <!-- Мой магазин: отчёт за день -->
+    <section id="v-report" class="view">
+      <div class="datebar">
+        <button class="btn" id="d-prev" type="button" aria-label="Предыдущий день">‹</button>
+        <input type="date" id="d-date">
+        <button class="btn" id="d-next" type="button" aria-label="Следующий день">›</button>
+      </div>
+      <div class="kpis" id="r-kpis"></div>
+      <h3>По товарам</h3>
+      <div id="r-items"></div>
+      <h3>Операции</h3>
+      <ul class="list" id="r-ops"></ul>
+    </section>
+
+    <!-- Магазины, к которым подключились -->
+    <section id="v-catalog" class="view">
+      <form id="f-join" class="joinbar">
+        <input name="code" required maxlength="7" placeholder="Код магазина" autocapitalize="characters" autocomplete="off" class="code-input">
+        <button class="btn primary" type="submit">Подключиться</button>
+      </form>
+      <p class="err" id="join-err"></p>
+      <div id="c-body">
+        <input id="cq" type="search" placeholder="Поиск по всем магазинам…" autocomplete="off">
+        <div class="chips" id="c-chips"></div>
+        <ul class="list" id="c-list"></ul>
+      </div>
+    </section>
+
+    <!-- Профиль -->
+    <section id="v-profile" class="view">
+      <div class="card" id="pr-shop"></div>
+      <div class="card" id="pr-viewers-card">
+        <h3>Подключились к моему магазину</h3>
+        <ul class="list" id="pr-viewers"></ul>
+      </div>
+      <div class="card">
+        <h3>Магазины, к которым я подключён</h3>
+        <ul class="list" id="pr-joined"></ul>
+      </div>
+      <div class="card">
+        <h3>Уведомления</h3>
+        <p id="push-state" class="muted"></p>
+        <button class="btn" id="push-on" type="button">Включить уведомления</button>
+      </div>
+      <div class="card" id="pr-key"></div>
+      <div class="card" id="install-card" hidden>
+        <button class="btn primary" id="install" type="button">Установить приложение на телефон</button>
+      </div>
+      <button class="btn danger" id="logout" type="button">Выйти с этого телефона</button>
+    </section>
+  </main>
+
+  <nav class="tabs" id="tabs" hidden></nav>
+
+  <dialog id="dlg"><form id="dlg-form"></form></dialog>
+  <div id="toast" class="toast" role="status"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
