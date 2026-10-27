@@ -70,8 +70,6 @@ input[type=search] { margin: 0; background: var(--card); }
   background: var(--card); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,.12);
 }
 .seg input { display: none; }
-#f-auth:not(.register) .reg-only { display: none; }
-#f-auth .btn, #f-join .btn { width: 100%; }
 
 .err { color: var(--danger); font-size: 14px; margin: 8px 0 0; }
 .hint { font-weight: 600; margin: 0 0 8px; }
@@ -159,7 +157,26 @@ dialog h2 { margin: 0 0 16px; font-size: 18px; }
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
-body[data-role=store] .seller-only { display: none; }
+.hero { text-align: center; padding: 12px 8px 16px; color: var(--muted); }
+.hero img { border-radius: 16px; }
+.hero p { margin: 8px 0 0; }
+#f-start:not(.join) .only-join, #f-start.join .only-open { display: none; }
+#f-start .btn { width: 100%; }
+.code-input { text-transform: uppercase; letter-spacing: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.code-input::placeholder { letter-spacing: normal; font-family: inherit; text-transform: none; }
+.link {
+  display: block; margin: 8px auto; background: none; border: 0; color: var(--pri);
+  font: inherit; font-size: 14px; text-decoration: underline; cursor: pointer; text-align: center;
+}
+.joinbar { display: flex; gap: 8px; }
+.joinbar input { margin: 0; flex: 1; background: var(--card); }
+#join-err { margin: 6px 2px 0; }
+#c-body { margin-top: 12px; }
+.share { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 10px 0; }
+.share .btn { padding: 10px 6px; font-size: 14px; text-decoration: none; text-align: center; }
+.share .wa { background: #25d366; border-color: #25d366; color: #fff; }
+.share .tg { background: #229ed9; border-color: #229ed9; color: #fff; }
+.key { font: 700 20px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 3px; text-align: center; padding: 10px; background: var(--bg); border-radius: 10px; margin: 8px 0; }
 
 @media (max-width: 400px) {
   #v-products .item { flex-wrap: wrap; }

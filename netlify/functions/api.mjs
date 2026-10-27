@@ -1,8 +1,9 @@
 // API приложения: /api/<действие>
+// Без регистрации: человек вводит имя, и этот телефон получает свой ключ доступа.
+// Любой может открыть свой магазин (получает 6-значный код) и подключаться к чужим по коду.
 import crypto from 'node:crypto';
 import {
-  store, getJSON, update, HttpError, secrets, signToken, verifyToken,
-  hashPassword, checkPassword, notify, money, LOW_STOCK,
+  store, getJSON, update, HttpError, secrets, signToken, verifyToken, notify, money, LOW_STOCK,
 } from '../lib/core.mjs';
 
 /* ---------- проверка входных данных ---------- */
@@ -14,8 +15,8 @@ const num = (v, name) => {
   if (!Number.isFinite(n) || n < 0 || n > 1e12) bad(`Неверное значение: ${name}`);
   return n;
 };
-const str = (v, name, max = 100) => {
-  const s = String(v ?? '').trim();
+const str = (v, name, max = 60) => {
+  const s = String(v ?? '').trim().replace(/\s+/g, ' ');
   if (!s) bad(`Укажите: ${name}`);
   if (s.length > max) bad(`Слишком длинно: ${name}`);
   return s;
@@ -25,35 +26,93 @@ const date = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v ?? '')) ? String(v) : b
 const at = (v) => (Number.isFinite(Number(v)) && Math.abs(Number(v) - Date.now()) < 400 * 864e5 ? Number(v) : Date.now());
 const byName = (a, b) => a.name.localeCompare(b.name, 'ru');
 const newId = () => crypto.randomBytes(9).toString('base64url');
-const emailKey = (e) => 'login:' + crypto.createHash('sha256').update(e).digest('hex').slice(0, 40);
 const sk = (uid) => `seller:${uid}`;
 
-const CODE_ABC = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const ABC = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // без похожих 0/O, 1/I
+const randCode = (n) => Array.from({ length: n }, () => ABC[crypto.randomInt(ABC.length)]).join('');
+const cleanCode = (v) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
 async function createCode(sellerId, sellerName) {
   for (let i = 0; i < 20; i++) {
-    const c = Array.from({ length: 6 }, () => CODE_ABC[crypto.randomInt(CODE_ABC.length)]).join('');
+    const c = randCode(6);
     const r = await store().setJSON(`code:${c}`, { sellerId, sellerName }, { onlyIfNew: true });
     if (r.modified) return c;
   }
   return bad('Не удалось создать код', 500);
 }
 
+async function createUser(name) {
+  const uid = newId();
+  let restoreKey;
+  for (let i = 0; i < 20 && !restoreKey; i++) {
+    const k = randCode(8);
+    const r = await store().setJSON(`restore:${k}`, { uid }, { onlyIfNew: true });
+    if (r.modified) restoreKey = k;
+  }
+  if (!restoreKey) bad('Не удалось создать ключ', 500);
+  const me = { uid, name, restoreKey, createdAt: Date.now() };
+  await store().setJSON(`user:${uid}`, me);
+  return me;
+}
+
 function sellerView(s) {
   return {
     name: s.name,
+    owner: s.owner,
     code: s.code,
     products: Object.values(s.products).sort(byName),
     viewers: Object.entries(s.viewers).map(([vid, v]) => ({ id: vid, ...v })),
   };
 }
 
-async function ensureSeller(uid, name) {
-  let s = await getJSON(sk(uid));
-  if (!s) {
-    const code = await createCode(uid, name);
-    s = await update(sk(uid), (cur) => cur ?? { name, code, products: {}, viewers: {}, recent: [] });
-  }
-  return s;
+async function openShop(me, shopName) {
+  if (await getJSON(sk(me.uid))) bad('У вас уже есть магазин');
+  const code = await createCode(me.uid, shopName);
+  await update(sk(me.uid), (cur) => cur ?? {
+    name: shopName, owner: me.name, code, products: {}, viewers: {}, recent: [], createdAt: Date.now(),
+  });
+}
+
+async function joinShop(me, rawCode) {
+  const code = cleanCode(rawCode);
+  if (code.length !== 6) bad('Код — 6 символов');
+  const c = await getJSON(`code:${code}`);
+  if (!c) bad('Код не найден. Проверьте у владельца магазина.', 404);
+  if (c.sellerId === me.uid) bad('Это код вашего собственного магазина');
+  await update(sk(c.sellerId), (cur) => {
+    if (!cur) bad('Магазин не найден', 404);
+    if (cur.code !== code) bad('Код устарел — попросите новый');
+    cur.viewers[me.uid] = { name: me.name, joinedAt: Date.now() };
+    return cur;
+  });
+  await update(`links:${me.uid}`, (list) => {
+    const l = (list || []).filter((x) => x.sellerId !== c.sellerId);
+    l.push({ sellerId: c.sellerId, sellerName: c.sellerName, code });
+    return l;
+  });
+}
+
+async function state(uid) {
+  const me = await getJSON(`user:${uid}`);
+  if (!me) bad('Войдите заново', 401);
+  const own = await getJSON(sk(uid));
+  const links = (await getJSON(`links:${uid}`)) || [];
+  const joined = await Promise.all(links.map(async (l) => {
+    const s = await getJSON(sk(l.sellerId));
+    const access = !!s?.viewers?.[uid];
+    return {
+      id: l.sellerId,
+      name: s?.name || l.sellerName,
+      owner: s?.owner || '',
+      code: l.code,
+      access,
+      // подключённым не показываем цену закупа
+      products: access
+        ? Object.values(s.products).map(({ id: pid, name, price, stock }) => ({ id: pid, name, price, stock })).sort(byName)
+        : [],
+    };
+  }));
+  return { me, shop: own ? sellerView(own) : null, joined };
 }
 
 async function addOp(uid, d, op) {
@@ -65,7 +124,7 @@ async function addOp(uid, d, op) {
   });
 }
 
-// Push после изменения товара: магазинам — новинка/поступление/цена, продавцу — «заканчивается»
+// Push после изменения товара: подключённым — новинка/поступление/цена, владельцу — «заканчивается»
 async function pushProduct(sellerId, s, before, after) {
   if (!after) return;
   const viewers = Object.keys(s.viewers || {});
@@ -86,28 +145,29 @@ async function pushProduct(sellerId, s, before, after) {
 
 /* ---------- без входа ---------- */
 const PUBLIC = {
-  async register(b) {
-    const email = str(b.email, 'email', 200).toLowerCase();
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) bad('Неверный email');
-    const password = String(b.password || '');
-    if (password.length < 6) bad('Пароль — минимум 6 символов');
-    const name = str(b.name, 'название');
-    const role = b.role === 'store' ? 'store' : 'seller';
-    const uid = newId();
-    const r = await store().setJSON(emailKey(email), { uid, ...hashPassword(password) }, { onlyIfNew: true });
-    if (!r.modified) bad('Этот email уже зарегистрирован — войдите', 409);
-    await store().setJSON(`user:${uid}`, { uid, email, name, role, createdAt: Date.now() });
-    if (role === 'seller') await ensureSeller(uid, name);
-    return { token: await signToken({ uid, role }) };
+  // Первый вход: имя + (название магазина ИЛИ код для подключения)
+  async start(b) {
+    const name = str(b.name, 'ваше имя', 40);
+    const shopName = b.shopName ? str(b.shopName, 'название магазина') : null;
+    const code = b.code ? cleanCode(b.code) : null;
+    if (!shopName && !code) bad('Укажите название магазина или код');
+    if (code) {
+      // проверяем код до создания пользователя, чтобы не плодить пустых
+      if (code.length !== 6) bad('Код — 6 символов');
+      if (!(await getJSON(`code:${code}`))) bad('Код не найден. Проверьте у владельца магазина.', 404);
+    }
+    const me = await createUser(name);
+    if (shopName) await openShop(me, shopName);
+    if (code) await joinShop(me, code);
+    return { token: await signToken({ uid: me.uid }), ...(await state(me.uid)) };
   },
 
-  async login(b) {
-    const email = str(b.email, 'email', 200).toLowerCase();
-    const rec = await getJSON(emailKey(email));
-    if (!rec || !checkPassword(String(b.password || ''), rec.salt, rec.hash)) bad('Неверный email или пароль');
-    const me = await getJSON(`user:${rec.uid}`);
-    if (!me) bad('Аккаунт повреждён, зарегистрируйтесь заново');
-    return { token: await signToken({ uid: rec.uid, role: me.role }) };
+  // Вход на другом телефоне по ключу восстановления
+  async restore(b) {
+    const key = cleanCode(b.key);
+    const r = key.length === 8 ? await getJSON(`restore:${key}`) : null;
+    if (!r) bad('Ключ не найден. Проверьте 8 символов.');
+    return { token: await signToken({ uid: r.uid }), ...(await state(r.uid)) };
   },
 
   async vapid() {
@@ -117,25 +177,29 @@ const PUBLIC = {
 
 /* ---------- любой вошедший ---------- */
 const COMMON = {
-  async state(u) {
-    const me = await getJSON(`user:${u.uid}`);
-    if (!me) bad('Войдите заново', 401);
-    if (me.role === 'seller') return { me, ...sellerView(await ensureSeller(u.uid, me.name)) };
+  state: (u) => state(u.uid),
 
-    const links = (await getJSON(`links:${u.uid}`)) || [];
-    const sellers = await Promise.all(links.map(async (l) => {
-      const s = await getJSON(sk(l.sellerId));
-      const access = !!s?.viewers?.[u.uid];
-      return {
-        id: l.sellerId,
-        name: s?.name || l.sellerName,
-        code: l.code,
-        access,
-        // магазину не показываем цену закупа
-        products: access ? Object.values(s.products).map(({ id: pid, name, price, stock }) => ({ id: pid, name, price, stock })).sort(byName) : [],
-      };
-    }));
-    return { me, sellers };
+  async open(u, b) {
+    const me = await getJSON(`user:${u.uid}`);
+    await openShop(me, str(b.shopName, 'название магазина'));
+    return state(u.uid);
+  },
+
+  async join(u, b) {
+    const me = await getJSON(`user:${u.uid}`);
+    await joinShop(me, b.code);
+    return state(u.uid);
+  },
+
+  async unlink(u, b) {
+    const sid = id(b.sellerId);
+    await update(sk(sid), (cur) => {
+      if (!cur?.viewers?.[u.uid]) return undefined;
+      delete cur.viewers[u.uid];
+      return cur;
+    });
+    await update(`links:${u.uid}`, (list) => (list ? list.filter((x) => x.sellerId !== sid) : undefined));
+    return state(u.uid);
   },
 
   async subscribe(u, b) {
@@ -155,7 +219,7 @@ const COMMON = {
   },
 };
 
-/* ---------- продавец ---------- */
+/* ---------- владелец своего магазина ---------- */
 const SELLER = {
   async product(u, b) {
     const name = str(b.name, 'название');
@@ -237,8 +301,8 @@ const SELLER = {
   },
 
   async newcode(u) {
-    const me = await getJSON(`user:${u.uid}`);
-    const code = await createCode(u.uid, me.name);
+    const shop = await getJSON(sk(u.uid));
+    const code = await createCode(u.uid, shop.name);
     let old;
     const s = await update(sk(u.uid), (cur) => { old = cur.code; cur.code = code; return cur; });
     if (old && old !== code) await store().delete(`code:${old}`);
@@ -290,39 +354,6 @@ async function move(u, b, type) {
   return sellerView(s);
 }
 
-/* ---------- магазин ---------- */
-const STORE = {
-  async join(u, b) {
-    const code = str(b.code, 'код', 12).toUpperCase();
-    const c = await getJSON(`code:${code}`);
-    if (!c) bad('Код не найден. Проверьте у продавца.', 404);
-    const me = await getJSON(`user:${u.uid}`);
-    await update(sk(c.sellerId), (cur) => {
-      if (!cur) bad('Продавец не найден', 404);
-      if (cur.code !== code) bad('Код устарел — попросите новый у продавца');
-      cur.viewers[u.uid] = { name: me.name, joinedAt: Date.now() };
-      return cur;
-    });
-    await update(`links:${u.uid}`, (list) => {
-      const l = (list || []).filter((x) => x.sellerId !== c.sellerId);
-      l.push({ sellerId: c.sellerId, sellerName: c.sellerName, code });
-      return l;
-    });
-    return COMMON.state(u);
-  },
-
-  async unlink(u, b) {
-    const sid = id(b.sellerId);
-    await update(sk(sid), (cur) => {
-      if (!cur?.viewers?.[u.uid]) return undefined;
-      delete cur.viewers[u.uid];
-      return cur;
-    });
-    await update(`links:${u.uid}`, (list) => (list ? list.filter((x) => x.sellerId !== sid) : undefined));
-    return COMMON.state(u);
-  },
-};
-
 /* ---------- маршрутизация ---------- */
 export default async (req) => {
   try {
@@ -336,12 +367,15 @@ export default async (req) => {
 
     const token = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
     const user = await verifyToken(token);
-    if (!user) return Response.json({ error: 'Войдите заново' }, { status: 401 });
+    if (!user?.uid) return Response.json({ error: 'Войдите заново' }, { status: 401 });
 
-    const table = user.role === 'seller' ? SELLER : STORE;
-    const fn = Object.hasOwn(COMMON, action) ? COMMON[action] : Object.hasOwn(table, action) ? table[action] : null;
-    if (!fn) return Response.json({ error: 'Неизвестное действие' }, { status: 404 });
-    return Response.json(await fn(user, body));
+    if (Object.hasOwn(COMMON, action)) return Response.json(await COMMON[action](user, body));
+    if (Object.hasOwn(SELLER, action)) {
+      // действия с товарами — только в своём магазине
+      if (!(await getJSON(sk(user.uid)))) bad('Сначала откройте свой магазин', 403);
+      return Response.json(await SELLER[action](user, body));
+    }
+    return Response.json({ error: 'Неизвестное действие' }, { status: 404 });
   } catch (e) {
     const status = e.status || 500;
     if (status === 500) console.error(e);

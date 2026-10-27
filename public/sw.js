@@ -1,5 +1,5 @@
 // Service worker: офлайн-кэш + приём push-уведомлений
-const CACHE = 'sklad-v2';
+const CACHE = 'sklad-v3';
 const ASSETS = [
   './', 'index.html', 'styles.css', 'app.js', 'manifest.json',
   'icons/icon-192.png', 'icons/icon-512.png',

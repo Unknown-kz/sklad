@@ -19,36 +19,35 @@
   </header>
 
   <main>
-    <!-- Вход / регистрация -->
-    <section id="v-auth" class="view on">
+    <!-- Первый экран: открыть магазин или присоединиться -->
+    <section id="v-start" class="view on">
+      <div class="hero">
+        <img src="icons/icon-192.png" alt="" width="64" height="64">
+        <p>Товары, цены и остатки — у вас и у тех, кому вы дали код</p>
+      </div>
       <div class="card">
-        <div class="seg" id="auth-seg">
-          <button type="button" data-auth="login" class="on">Вход</button>
-          <button type="button" data-auth="register">Регистрация</button>
+        <div class="seg">
+          <button type="button" data-mode="open" class="on">Открыть магазин</button>
+          <button type="button" data-mode="join">Присоединиться</button>
         </div>
-        <form id="f-auth">
-          <div class="reg-only">
-            <div class="seg role">
-              <label><input type="radio" name="role" value="seller" checked> Продавец</label>
-              <label><input type="radio" name="role" value="store"> Магазин</label>
-            </div>
-            <label>Название
-              <input name="name" placeholder="ИП Асанов / Магазин «Береке»">
-            </label>
-          </div>
-          <label>Email
-            <input name="email" type="email" required autocomplete="email">
+        <form id="f-start">
+          <label>Ваше имя
+            <input name="name" required maxlength="40" placeholder="Например, Асан" autocomplete="given-name">
           </label>
-          <label>Пароль
-            <input name="password" type="password" required minlength="6" autocomplete="current-password">
+          <label class="only-open">Название магазина
+            <input name="shopName" maxlength="60" placeholder="Например, Береке" autocomplete="off">
           </label>
-          <button class="btn primary" type="submit">Войти</button>
-          <p class="err" id="auth-err"></p>
+          <label class="only-join">Код магазина (6 символов)
+            <input name="code" maxlength="7" placeholder="K7M2QX" autocapitalize="characters" autocomplete="off" class="code-input">
+          </label>
+          <button class="btn primary" type="submit">Открыть магазин</button>
+          <p class="err" id="start-err"></p>
         </form>
       </div>
+      <button type="button" class="link" id="restore-open">Уже пользовались на другом телефоне? Войти по ключу</button>
     </section>
 
-    <!-- Продавец: товары -->
+    <!-- Мой магазин: товары -->
     <section id="v-products" class="view">
       <div class="toolbar">
         <input id="q" type="search" placeholder="Поиск товара…" autocomplete="off">
@@ -58,7 +57,7 @@
       <ul class="list" id="p-list"></ul>
     </section>
 
-    <!-- Продавец: отчёт за день -->
+    <!-- Мой магазин: отчёт за день -->
     <section id="v-report" class="view">
       <div class="datebar">
         <button class="btn" id="d-prev" type="button" aria-label="Предыдущий день">‹</button>
@@ -72,42 +71,41 @@
       <ul class="list" id="r-ops"></ul>
     </section>
 
-    <!-- Магазин: каталог всех продавцов -->
+    <!-- Магазины, к которым подключились -->
     <section id="v-catalog" class="view">
-      <input id="cq" type="search" placeholder="Поиск по всем продавцам…" autocomplete="off">
-      <div class="chips" id="c-chips"></div>
-      <ul class="list" id="c-list"></ul>
-    </section>
-
-    <!-- Магазин: продавцы -->
-    <section id="v-sellers" class="view">
-      <form id="f-join" class="card">
-        <label>Код продавца
-          <input name="code" required maxlength="6" placeholder="Например K7M2QX" autocapitalize="characters" autocomplete="off">
-        </label>
-        <button class="btn primary" type="submit">Подключить</button>
-        <p class="err" id="join-err"></p>
+      <form id="f-join" class="joinbar">
+        <input name="code" required maxlength="7" placeholder="Код магазина" autocapitalize="characters" autocomplete="off" class="code-input">
+        <button class="btn primary" type="submit">Подключиться</button>
       </form>
-      <ul class="list" id="s-list"></ul>
+      <p class="err" id="join-err"></p>
+      <div id="c-body">
+        <input id="cq" type="search" placeholder="Поиск по всем магазинам…" autocomplete="off">
+        <div class="chips" id="c-chips"></div>
+        <ul class="list" id="c-list"></ul>
+      </div>
     </section>
 
     <!-- Профиль -->
     <section id="v-profile" class="view">
-      <div class="card" id="pr-info"></div>
-      <div class="card seller-only" id="pr-code"></div>
-      <div class="card seller-only">
-        <h3>Магазины с доступом</h3>
+      <div class="card" id="pr-shop"></div>
+      <div class="card" id="pr-viewers-card">
+        <h3>Подключились к моему магазину</h3>
         <ul class="list" id="pr-viewers"></ul>
+      </div>
+      <div class="card">
+        <h3>Магазины, к которым я подключён</h3>
+        <ul class="list" id="pr-joined"></ul>
       </div>
       <div class="card">
         <h3>Уведомления</h3>
         <p id="push-state" class="muted"></p>
         <button class="btn" id="push-on" type="button">Включить уведомления</button>
       </div>
+      <div class="card" id="pr-key"></div>
       <div class="card" id="install-card" hidden>
-        <button class="btn primary" id="install" type="button">Установить приложение</button>
+        <button class="btn primary" id="install" type="button">Установить приложение на телефон</button>
       </div>
-      <button class="btn danger" id="logout" type="button">Выйти</button>
+      <button class="btn danger" id="logout" type="button">Выйти с этого телефона</button>
     </section>
   </main>
 

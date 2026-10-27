@@ -1,5 +1,5 @@
-// Склад — PWA: товары, цены, остатки, продажи, закуп, доступ магазинов по коду, push.
-// Сервер — Netlify Functions (/api/*), данные — Netlify Blobs.
+// Склад — PWA: товары, цены, остатки, продажи, закуп, доступ по коду, push.
+// Без регистрации: имя + название магазина (или код). Сервер — Netlify Functions (/api/*).
 
 /* ------------------------------------------------------------------ */
 /*  Утилиты                                                            */
@@ -15,6 +15,7 @@ const r3 = (n) => Math.round(n * 1000) / 1000;
 const pad = (n) => String(n).padStart(2, '0');
 const ymd = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+const cleanCode = (v) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const LOW_STOCK = 5;
 
 const ls = {
@@ -37,16 +38,21 @@ function toast(msg) {
 const S = {
   token: ls.get('sk_token'),
   me: null,
-  // продавец
+  // мой магазин (null — пока не открыт)
+  shop: null,
   base: [],       // товары, как их знает сервер
   products: [],   // base + ещё не отправленные операции
   viewers: [], code: '',
   outbox: ls.get('sk_outbox') || [],
-  ops: [], date: ymd(), opsLoaded: false,
-  // магазин
-  sellers: [], filter: 'all',
-  view: 'auth', started: false,
+  ops: [], date: ymd(),
+  // магазины, к которым я подключён
+  joined: [], filter: 'all',
+  view: 'start', started: false, tabsKey: '',
 };
+
+// Ссылка вида https://сайт/?join=K7M2QX — сразу подставляет код
+const linkCode = cleanCode(new URLSearchParams(location.search).get('join')).slice(0, 6);
+if (linkCode) history.replaceState(null, '', location.pathname);
 
 /* ------------------------------------------------------------------ */
 /*  Сервер                                                             */
@@ -112,30 +118,36 @@ $('#install').onclick = () => {
 /* ------------------------------------------------------------------ */
 /*  Навигация                                                          */
 /* ------------------------------------------------------------------ */
-const TABS = {
-  seller: [['products', '📦', 'Товары'], ['report', '📊', 'Отчёт'], ['profile', '👤', 'Профиль']],
-  store: [['catalog', '🛒', 'Каталог'], ['sellers', '🏪', 'Продавцы'], ['profile', '👤', 'Профиль']],
-};
-const TITLES = {
-  auth: 'Склад', products: 'Товары', report: 'Продажи и закуп за день',
-  catalog: 'Каталог', sellers: 'Мои продавцы', profile: 'Профиль',
-};
+function titleFor(view) {
+  return {
+    start: 'Склад',
+    products: S.shop?.name || 'Мой магазин',
+    report: 'Продажи и закуп за день',
+    catalog: 'Магазины',
+    profile: 'Профиль',
+  }[view] || 'Склад';
+}
 
 function show(view) {
   S.view = view;
   $$('.view').forEach((v) => v.classList.toggle('on', v.id === 'v-' + view));
   $$('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.view === view));
-  $('#title').textContent = TITLES[view] || 'Склад';
+  $('#title').textContent = titleFor(view);
   scrollTo(0, 0);
   if (view === 'report') loadOps();
 }
 
-function buildTabs(role) {
-  const tabs = $('#tabs');
-  tabs.hidden = !role;
-  tabs.innerHTML = role
-    ? TABS[role].map(([v, i, l]) => `<button type="button" data-view="${v}"><span>${i}</span>${l}</button>`).join('')
-    : '';
+function buildTabs() {
+  const tabs = S.shop
+    ? [['products', '📦', 'Мой магазин'], ['report', '📊', 'Отчёт'], ['catalog', '🏪', 'Магазины'], ['profile', '👤', 'Профиль']]
+    : [['catalog', '🏪', 'Магазины'], ['profile', '👤', 'Профиль']];
+  const key = tabs.map((t) => t[0]).join();
+  if (key === S.tabsKey) return;
+  S.tabsKey = key;
+  $('#tabs').hidden = false;
+  $('#tabs').innerHTML = tabs.map(([v, i, l]) => `<button type="button" data-view="${v}"><span>${i}</span>${l}</button>`).join('');
+  if (S.started && !tabs.some((t) => t[0] === S.view)) show(tabs[0][0]);
+  else $$('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.view === S.view));
 }
 $('#tabs').addEventListener('click', (e) => {
   const b = e.target.closest('button');
@@ -145,16 +157,18 @@ $('#tabs').addEventListener('click', (e) => {
 /* ------------------------------------------------------------------ */
 /*  Диалог-форма                                                       */
 /* ------------------------------------------------------------------ */
-function form({ title, fields, submit = 'Сохранить', hint, onSubmit, extra }) {
+function form({ title, text, fields, submit = 'Сохранить', hint, onSubmit, extra }) {
   const dlg = $('#dlg');
   const f = $('#dlg-form');
   f.innerHTML = `
     <h2>${esc(title)}</h2>
+    ${text ? `<p class="muted">${esc(text)}</p>` : ''}
     ${fields.map((fl) => `
       <label>${esc(fl.label)}
         <input name="${fl.name}" type="${fl.type || 'text'}"
           ${fl.type === 'number' ? 'inputmode="decimal" step="any"' : ''}
           ${fl.required ? 'required' : ''} ${fl.min != null ? `min="${fl.min}"` : ''}
+          ${fl.maxlength ? `maxlength="${fl.maxlength}"` : ''} class="${fl.cls || ''}"
           value="${esc(fl.value ?? '')}" placeholder="${esc(fl.placeholder || '')}" autocomplete="off">
       </label>`).join('')}
     <p class="hint" id="dlg-hint"></p>
@@ -186,42 +200,61 @@ function form({ title, fields, submit = 'Сохранить', hint, onSubmit, ex
 }
 
 /* ------------------------------------------------------------------ */
-/*  Вход и регистрация                                                 */
+/*  Первый экран: открыть магазин / присоединиться / войти по ключу    */
 /* ------------------------------------------------------------------ */
-let authMode = 'login';
-function setAuthMode(mode) {
-  authMode = mode;
-  $$('[data-auth]').forEach((x) => x.classList.toggle('on', x.dataset.auth === mode));
-  $('#f-auth').classList.toggle('register', mode === 'register');
-  $('#f-auth [type=submit]').textContent = mode === 'login' ? 'Войти' : 'Создать аккаунт';
-  $('#auth-err').textContent = '';
+let startMode = 'open';
+function setStartMode(mode) {
+  startMode = mode;
+  $$('[data-mode]').forEach((x) => x.classList.toggle('on', x.dataset.mode === mode));
+  const f = $('#f-start');
+  f.classList.toggle('join', mode === 'join');
+  f.shopName.required = mode === 'open';
+  f.code.required = mode === 'join';
+  f.querySelector('[type=submit]').textContent = mode === 'open' ? 'Открыть магазин' : 'Присоединиться';
+  $('#start-err').textContent = '';
 }
-$$('[data-auth]').forEach((b) => { b.onclick = () => setAuthMode(b.dataset.auth); });
+$$('[data-mode]').forEach((b) => { b.onclick = () => setStartMode(b.dataset.mode); });
 
-$('#f-auth').addEventListener('submit', async (e) => {
+$('#f-start').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const f = new FormData(e.target);
-  const btn = e.target.querySelector('[type=submit]');
+  const f = e.target;
+  const btn = f.querySelector('[type=submit]');
   btn.disabled = true;
-  $('#auth-err').textContent = '';
+  $('#start-err').textContent = '';
   try {
-    const body = { email: f.get('email'), password: f.get('password') };
-    if (authMode === 'register') Object.assign(body, { name: f.get('name'), role: f.get('role') });
-    const { token } = await api(authMode, body);
-    S.token = token;
-    ls.set('sk_token', token);
-    e.target.reset();
-    await boot();
+    const body = { name: f.name.value };
+    if (startMode === 'open') body.shopName = f.shopName.value; else body.code = f.code.value;
+    const res = await api('start', body);
+    signedIn(res);
+    if (startMode === 'open') toast(`Магазин открыт! Ваш код: ${res.shop.code}`);
+    else toast('Подключено');
   } catch (err) {
-    $('#auth-err').textContent = err.message;
+    $('#start-err').textContent = err.message;
   } finally {
     btn.disabled = false;
   }
 });
 
+$('#restore-open').onclick = () => form({
+  title: 'Вход по ключу',
+  text: 'Ключ из 8 символов есть в Профиле на старом телефоне.',
+  submit: 'Войти',
+  fields: [{ name: 'key', label: 'Ключ восстановления', required: true, maxlength: 9, cls: 'code-input', placeholder: 'ABCD-EFGH' }],
+  onSubmit: async (v) => { signedIn(await api('restore', { key: v.key })); toast('С возвращением!'); },
+});
+
+function signedIn(res) {
+  S.token = res.token;
+  ls.set('sk_token', res.token);
+  const { token, ...st } = res;
+  ls.set('sk_state', st);
+  applyState(st);
+}
+
 $('#logout').onclick = () => {
-  const pending = S.outbox.length ? `\nВнимание: ${S.outbox.length} операций ещё не отправлены и пропадут.` : '';
-  if (confirm('Выйти из аккаунта?' + pending)) logout();
+  const pending = S.outbox.length ? `\n\nВнимание: ${S.outbox.length} операций ещё не отправлены и пропадут.` : '';
+  const key = S.me?.restoreKey ? `\n\nЧтобы вернуться, понадобится ключ: ${fmtKey(S.me.restoreKey)}` : '';
+  if (confirm('Выйти с этого телефона?' + key + pending)) logout();
 };
 
 async function logout(expired = false) {
@@ -233,7 +266,7 @@ async function logout(expired = false) {
       await sub.unsubscribe();
     }
   } catch { /* */ }
-  ['sk_token', 'sk_state', 'sk_outbox'].forEach(ls.del);
+  Object.keys(localStorage).filter((k) => k.startsWith('sk_')).forEach(ls.del);
   location.reload();
 }
 
@@ -241,15 +274,21 @@ async function logout(expired = false) {
 /*  Запуск и обновление данных                                         */
 /* ------------------------------------------------------------------ */
 async function boot() {
-  if (!S.token) { buildTabs(null); setAuthMode(authMode); show('auth'); return; }
+  if (!S.token) {
+    if (linkCode) { setStartMode('join'); $('#f-start').code.value = linkCode; }
+    else setStartMode('open');
+    show('start');
+    return;
+  }
   const cached = ls.get('sk_state');
   if (cached?.me) applyState(cached);
   await refresh();
   if (!S.me) {
-    // нет ни кэша, ни связи
-    $('#auth-err').textContent = 'Нет связи с сервером. Проверьте интернет и обновите страницу.';
-    show('auth');
+    $('#start-err').textContent = 'Нет связи с сервером. Проверьте интернет и обновите страницу.';
+    show('start');
+    return;
   }
+  if (linkCode) offerJoin(linkCode);
 }
 
 async function refresh() {
@@ -265,27 +304,29 @@ async function refresh() {
 
 function applyState(st) {
   S.me = st.me;
-  if (st.me.role === 'seller') applySeller(st);
-  else { S.sellers = st.sellers || []; if (S.filter !== 'all' && !S.sellers.some((x) => x.id === S.filter)) S.filter = 'all'; }
+  S.shop = st.shop || null;
+  if (S.shop) applySeller(S.shop);
+  S.joined = st.joined || [];
+  if (S.filter !== 'all' && !S.joined.some((x) => x.id === S.filter && x.access)) S.filter = 'all';
+  buildTabs();
   if (!S.started) startUI();
   renderAll();
 }
 
 function applySeller(v) {
+  S.shop = { ...S.shop, ...v };
   S.base = v.products || [];
   S.viewers = v.viewers || [];
   S.code = v.code || '';
   derive();
   // кэшируем свежую версию для офлайна
   const st = ls.get('sk_state');
-  if (st?.me) ls.set('sk_state', { ...st, ...v });
+  if (st?.me) ls.set('sk_state', { ...st, shop: { ...(st.shop || {}), ...v } });
 }
 
 function startUI() {
   S.started = true;
-  document.body.dataset.role = S.me.role;
-  buildTabs(S.me.role);
-  show(S.me.role === 'seller' ? 'products' : 'catalog');
+  show(S.shop ? 'products' : 'catalog');
   renderPush();
   if (pushSupported && Notification.permission === 'granted') registerPush(true);
   flush();
@@ -301,12 +342,14 @@ function startUI() {
 }
 
 function renderAll() {
+  $('#title').textContent = titleFor(S.view);
   renderProfile();
-  if (S.me.role === 'seller') { renderProducts(); if (S.view === 'report') renderReport(); } else { renderSellers(); renderCatalog(); }
+  renderCatalog();
+  if (S.shop) { renderProducts(); if (S.view === 'report') renderReport(); }
 }
 
 /* ------------------------------------------------------------------ */
-/*  ПРОДАВЕЦ: очередь операций (продажа и закуп работают без интернета) */
+/*  МОЙ МАГАЗИН: очередь операций (продажа и закуп работают без интернета) */
 /* ------------------------------------------------------------------ */
 function applyOp(op, list) {
   const p = list.find((x) => x.id === op.id);
@@ -355,12 +398,12 @@ async function flush() {
 }
 
 /* ------------------------------------------------------------------ */
-/*  ПРОДАВЕЦ: товары                                                   */
+/*  МОЙ МАГАЗИН: товары                                                   */
 /* ------------------------------------------------------------------ */
 $('#q').addEventListener('input', renderProducts);
 
 function renderProducts() {
-  if (S.me?.role !== 'seller') return;
+  if (!S.shop) return;
   const q = $('#q').value.trim().toLowerCase();
   const list = S.products.filter((p) => !q || p.name.toLowerCase().includes(q));
   const value = S.products.reduce((s, p) => s + num(p.stock) * num(p.price), 0);
@@ -493,10 +536,10 @@ function editDialog(p) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  ПРОДАВЕЦ: отчёт за день                                            */
+/*  МОЙ МАГАЗИН: отчёт за день                                            */
 /* ------------------------------------------------------------------ */
 async function loadOps() {
-  if (S.me?.role !== 'seller') return;
+  if (!S.shop) return;
   $('#d-date').value = S.date;
   const want = S.date;
   try {
@@ -598,26 +641,41 @@ $('#r-ops').addEventListener('click', async (e) => {
 /* ------------------------------------------------------------------ */
 /*  ПРОФИЛЬ                                                            */
 /* ------------------------------------------------------------------ */
+const fmtKey = (k) => (k ? `${k.slice(0, 4)}-${k.slice(4)}` : '');
+const joinLink = (code) => `${location.origin}${location.pathname}?join=${code}`;
+const shareText = (name, code) => `Магазин «${name}»: смотрите товары, цены и остатки.\nКод для подключения: ${code}`;
+
 function renderProfile() {
   if (!S.me) return;
-  const isSeller = S.me.role === 'seller';
-  $('#pr-info').innerHTML = `
-    <b>${esc(S.me.name)}</b>
-    <div class="muted">${isSeller ? 'Продавец' : 'Магазин'} · ${esc(S.me.email || '')}</div>`;
-  if (!isSeller) return;
 
-  const code = S.code || '……';
-  $('#pr-code').innerHTML = `
-    <h3>Код для магазинов</h3>
-    <div class="code">${esc(code)}</div>
-    <p class="muted">Магазин вводит этот код и видит ваши товары, цены и остатки. Продажи, закуп и отчёты видны только вам.</p>
-    <div class="row">
-      <button type="button" class="btn ghost" id="code-new">Новый код</button>
-      <button type="button" class="btn primary" id="code-share">Поделиться</button>
-    </div>`;
-  $('#code-share').onclick = () => shareCode(code);
-  $('#code-new').onclick = newCode;
+  // мой магазин
+  if (S.shop) {
+    const code = S.code || '……';
+    const text = shareText(S.shop.name, code);
+    const link = joinLink(code);
+    $('#pr-shop').innerHTML = `
+      <h3>${esc(S.shop.name)}</h3>
+      <p class="muted">Владелец: ${esc(S.me.name)}. Дайте этот код тем, кто должен видеть ваши товары, цены и остатки.</p>
+      <div class="code">${esc(code)}</div>
+      <div class="share">
+        <a class="btn wa" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(`${text}\n${link}`)}">WhatsApp</a>
+        <a class="btn tg" target="_blank" rel="noopener" href="https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}">Telegram</a>
+        <button type="button" class="btn" id="code-share">${navigator.share ? 'Ещё…' : 'Копировать'}</button>
+      </div>
+      <p class="muted">Продажи, закуп, отчёты и цены закупа видите только вы.</p>
+      <button type="button" class="btn ghost sm" id="code-new">Сменить код</button>`;
+    $('#code-share').onclick = () => shareCode(text, link);
+    $('#code-new').onclick = newCode;
+  } else {
+    $('#pr-shop').innerHTML = `
+      <h3>Свой магазин</h3>
+      <p class="muted">Откройте свой магазин: добавляйте товары, отмечайте продажи и закуп, давайте код другим.</p>
+      <button type="button" class="btn primary" id="shop-open">Открыть свой магазин</button>`;
+    $('#shop-open').onclick = openShopDialog;
+  }
 
+  // кто подключился ко мне
+  $('#pr-viewers-card').hidden = !S.shop;
   $('#pr-viewers').innerHTML = S.viewers.length
     ? S.viewers.map((v) => `
       <li class="item">
@@ -626,26 +684,69 @@ function renderProfile() {
         <button type="button" class="btn sm danger" data-kick="${esc(v.id)}">Закрыть доступ</button>
       </li>`).join('')
     : '<li class="empty">Пока никто не подключился</li>';
+
+  // куда подключён я
+  $('#pr-joined').innerHTML = S.joined.length
+    ? S.joined.map((s) => `
+      <li class="item">
+        <div class="info"><b>${esc(s.name)}</b>
+          <small>${s.access ? `${s.products.length} товаров` : '<span class="warn">доступ закрыт</span>'}${s.owner ? ' · ' + esc(s.owner) : ''}</small></div>
+        <button type="button" class="btn sm ghost danger" data-unlink="${esc(s.id)}">Отключиться</button>
+      </li>`).join('')
+    : '<li class="empty">Пока нет. Введите код во вкладке «Магазины».</li>';
+
+  // ключ для входа на другом телефоне
+  $('#pr-key').innerHTML = `
+    <h3>${esc(S.me.name)}</h3>
+    <p class="muted">Ключ, чтобы войти на другом телефоне или после переустановки. Никому его не давайте и сохраните себе.</p>
+    <div class="key" id="key-box">••••-••••</div>
+    <div class="row"><button type="button" class="btn sm" id="key-show">Показать</button><button type="button" class="btn sm" id="key-copy">Копировать</button></div>`;
+  $('#key-show').onclick = () => { $('#key-box').textContent = fmtKey(S.me.restoreKey); };
+  $('#key-copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(fmtKey(S.me.restoreKey)); toast('Ключ скопирован'); } catch { $('#key-box').textContent = fmtKey(S.me.restoreKey); }
+  };
+}
+
+function openShopDialog() {
+  form({
+    title: 'Открыть свой магазин',
+    submit: 'Открыть',
+    fields: [{ name: 'shopName', label: 'Название магазина', required: true, maxlength: 60 }],
+    onSubmit: async (v) => {
+      const st = await api('open', { shopName: v.shopName }).catch(needNet);
+      ls.set('sk_state', st);
+      applyState(st);
+      show('products');
+      toast(`Магазин открыт! Ваш код: ${S.code}`);
+    },
+  });
 }
 
 $('#pr-viewers').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-kick]');
   if (!b) return;
   const v = S.viewers.find((x) => x.id === b.dataset.kick);
-  if (!v || !confirm(`Закрыть доступ магазину «${v.name}»?`)) return;
+  if (!v || !confirm(`Закрыть доступ для «${v.name}»?`)) return;
   try { applySeller(await api('kick', { storeId: v.id })); renderProfile(); toast('Доступ закрыт'); } catch (err) { toast(err.message); }
 });
 
-async function shareCode(code) {
-  const text = `Мой код продавца: ${code}\nОткройте ${location.origin}, зарегистрируйтесь как «Магазин» и введите код во вкладке «Продавцы».`;
+$('#pr-joined').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-unlink]');
+  if (!b) return;
+  const s = S.joined.find((x) => x.id === b.dataset.unlink);
+  if (!s || !confirm(`Отключиться от «${s.name}»?`)) return;
+  try { applyJoined(await api('unlink', { sellerId: s.id })); toast('Отключено'); } catch (err) { toast(err.message); }
+});
+
+async function shareCode(text, link) {
   try {
-    if (navigator.share) await navigator.share({ title: 'Код продавца', text });
-    else { await navigator.clipboard.writeText(text); toast('Скопировано'); }
+    if (navigator.share) await navigator.share({ title: 'Код магазина', text, url: link });
+    else { await navigator.clipboard.writeText(`${text}\n${link}`); toast('Скопировано — вставьте в любой чат'); }
   } catch { /* пользователь закрыл окно */ }
 }
 
 async function newCode() {
-  if (!confirm('Создать новый код? Старый перестанет работать для новых магазинов. Уже подключённые останутся.')) return;
+  if (!confirm('Сменить код? Старый перестанет работать для новых людей. Уже подключённые останутся.')) return;
   try {
     applySeller(await api('newcode', {}));
     renderProfile();
@@ -654,48 +755,44 @@ async function newCode() {
 }
 
 /* ------------------------------------------------------------------ */
-/*  МАГАЗИН: продавцы и каталог                                        */
+/*  МАГАЗИНЫ, к которым я подключён                                    */
 /* ------------------------------------------------------------------ */
-function applyStore(st) {
+function applyJoined(st) {
   ls.set('sk_state', st);
   applyState(st);
 }
 
-$('#f-join').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const code = String(new FormData(e.target).get('code') || '').trim().toUpperCase();
-  const err = $('#join-err');
-  err.textContent = '';
-  try {
-    applyStore(await api('join', { code }));
-    e.target.reset();
-    const s = S.sellers.find((x) => x.code === code);
-    toast(`Подключено: ${s?.name || code}`);
-  } catch (ex) {
-    err.textContent = ex.message;
-  }
-});
-
-function renderSellers() {
-  $('#s-list').innerHTML = S.sellers.length
-    ? S.sellers.map((s) => `
-      <li class="item">
-        <div class="info"><b>${esc(s.name)}</b>
-          <small>${s.access ? `${s.products.length} товаров` : '<span class="warn">доступ закрыт</span>'} · код ${esc(s.code)}</small></div>
-        ${s.access ? `<button type="button" class="btn sm" data-open="${esc(s.id)}">Товары</button>` : ''}
-        <button type="button" class="btn sm ghost danger" data-unlink="${esc(s.id)}" aria-label="Отключить">✕</button>
-      </li>`).join('')
-    : '<li class="empty">Введите код, который даст вам продавец</li>';
+async function joinByCode(raw) {
+  const st = await api('join', { code: raw });
+  applyJoined(st);
+  const s = S.joined.find((x) => x.code === cleanCode(raw));
+  if (s) S.filter = s.id;
+  show('catalog');
+  renderCatalog();
+  toast(`Подключено: ${s?.name || cleanCode(raw)}`);
 }
 
-$('#s-list').addEventListener('click', async (e) => {
-  const open = e.target.closest('[data-open]');
-  if (open) { S.filter = open.dataset.open; renderCatalog(); show('catalog'); return; }
-  const un = e.target.closest('[data-unlink]');
-  if (!un) return;
-  const s = S.sellers.find((x) => x.id === un.dataset.unlink);
-  if (!s || !confirm(`Отключить продавца «${s.name}»?`)) return;
-  try { applyStore(await api('unlink', { sellerId: s.id })); toast('Отключено'); } catch (err) { toast(err.message); }
+function offerJoin(code) {
+  if (S.code === code || S.joined.some((x) => x.code === code && x.access)) return;
+  if (confirm(`Подключиться к магазину по коду ${code}?`)) {
+    joinByCode(code).catch((e) => toast(e.message));
+  }
+}
+
+$('#f-join').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('#join-err');
+  err.textContent = '';
+  const btn = e.target.querySelector('[type=submit]');
+  btn.disabled = true;
+  try {
+    await joinByCode(e.target.code.value);
+    e.target.reset();
+  } catch (ex) {
+    err.textContent = ex.message;
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 $('#cq').addEventListener('input', renderCatalog);
@@ -705,33 +802,33 @@ $('#c-chips').addEventListener('click', (e) => {
 });
 
 function renderCatalog() {
-  if (S.me?.role !== 'store') return;
-  if (!S.sellers.length) {
-    $('#c-chips').innerHTML = '';
-    $('#c-list').innerHTML = '<li class="empty">Подключите продавца по коду во вкладке «Продавцы»</li>';
-    return;
-  }
-  $('#c-chips').innerHTML = [['all', 'Все'], ...S.sellers.filter((s) => s.access).map((s) => [s.id, s.name])]
+  if (!S.me) return;
+  const open = S.joined.filter((s) => s.access);
+  $('#c-body').hidden = !S.joined.length;
+  if (!S.joined.length) return;
+  $('#c-chips').innerHTML = [['all', 'Все'], ...open.map((s) => [s.id, s.name])]
     .map(([fid, n]) => `<button type="button" class="chip ${S.filter === fid ? 'on' : ''}" data-f="${esc(fid)}">${esc(n)}</button>`).join('');
 
   const q = $('#cq').value.trim().toLowerCase();
   const rows = [];
-  for (const s of S.sellers) {
+  for (const s of open) {
     if (S.filter !== 'all' && S.filter !== s.id) continue;
     for (const p of s.products) {
       if (q && !p.name.toLowerCase().includes(q) && !s.name.toLowerCase().includes(q)) continue;
-      rows.push({ ...p, seller: s.name });
+      rows.push({ ...p, shop: s.name });
     }
   }
   rows.sort((a, b) => (num(b.stock) > 0) - (num(a.stock) > 0) || a.name.localeCompare(b.name, 'ru'));
-  $('#c-list').innerHTML = rows.length
+  const closed = S.joined.filter((s) => !s.access).map((s) => esc(s.name)).join(', ');
+  $('#c-list').innerHTML = (rows.length
     ? rows.map((p) => `
       <li class="item ${num(p.stock) <= 0 ? 'out' : ''}">
         <div class="info"><b>${esc(p.name)}</b>
-          <small>${esc(p.seller)} · ${num(p.stock) > 0 ? `в наличии ${qtyFmt(p.stock)}` : 'нет в наличии'}</small></div>
+          <small>${esc(p.shop)} · ${num(p.stock) > 0 ? `в наличии ${qtyFmt(p.stock)}` : 'нет в наличии'}</small></div>
         <div class="price">${money(p.price)}</div>
       </li>`).join('')
-    : `<li class="empty">${q ? 'Ничего не найдено' : 'У продавца пока нет товаров'}</li>`;
+    : `<li class="empty">${q ? 'Ничего не найдено' : 'В магазине пока нет товаров'}</li>`)
+    + (closed ? `<li class="empty">Доступ закрыт: ${closed}</li>` : '');
 }
 
 /* ------------------------------------------------------------------ */
@@ -740,15 +837,16 @@ function renderCatalog() {
 const pushSupported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
 
 function renderPush() {
-  const what = S.me?.role === 'seller'
-    ? 'Сигнал, когда товар заканчивается, и итоги дня в 21:00.'
-    : 'Новые товары, поступления и смена цен у ваших продавцов.';
+  const what = [
+    S.shop ? 'когда ваш товар заканчивается и итоги дня в 21:00' : '',
+    'новые товары, поступления и смена цен в магазинах, к которым вы подключены',
+  ].filter(Boolean).join('; ');
   let st;
   if (!pushSupported) st = 'Этот браузер не поддерживает push. На iPhone: «Поделиться» → «На экран Домой», затем откройте приложение с иконки.';
-  else if (Notification.permission === 'granted') st = 'Включены на этом устройстве.';
+  else if (Notification.permission === 'granted') st = 'Включены на этом телефоне.';
   else if (Notification.permission === 'denied') st = 'Заблокированы в настройках браузера для этого сайта.';
   else st = 'Выключены.';
-  $('#push-state').textContent = `${st} ${what}`;
+  $('#push-state').textContent = `${st} Приходят: ${what}.`;
   const btn = $('#push-on');
   btn.hidden = !pushSupported || Notification.permission === 'denied';
   btn.textContent = Notification.permission === 'granted' ? 'Обновить подписку' : 'Включить уведомления';
@@ -774,6 +872,7 @@ async function registerPush(silent = false) {
       sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
     }
     await api('subscribe', { subscription: sub.toJSON() });
+    renderPush();
     if (!silent) toast('Уведомления включены');
   } catch (e) {
     if (!silent) toast(e.message);
