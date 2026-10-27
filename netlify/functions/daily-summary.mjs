@@ -12,7 +12,7 @@ export default async () => {
     for (const o of ops) {
       if (o.type === 'sale') { sales += Number(o.total || 0); n += 1; } else buys += Number(o.total || 0);
     }
-    await notify([sellerId], 'Итоги дня', `Продажи: ${money(sales)} (${n} опер.), закуп: ${money(buys)}`, `day-${today}`);
+    await notify([sellerId], 'Итоги дня', `Продажи: ${money(sales)} (${n} опер.)${buys ? `, закуп: ${money(buys)}` : ''}`, `day-${today}`);
   }
   return new Response('ok');
 };

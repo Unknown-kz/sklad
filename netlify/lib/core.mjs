@@ -13,8 +13,9 @@ export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
-let _store;
-export const store = () => (_store ||= getStore({ name: 'sklad', consistency: 'strong' }));
+// Не кэшируем: Netlify выдаёт свежий ключ доступа к хранилищу на каждый запрос,
+// а сохранённое подключение со временем получает «Token expired».
+export const store = () => getStore({ name: 'sklad', consistency: 'strong' });
 export const getJSON = (key) => store().get(key, { type: 'json' });
 
 /**

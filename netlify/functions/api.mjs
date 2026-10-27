@@ -124,6 +124,8 @@ async function addOp(uid, d, op) {
   });
 }
 
+const hasStock = (p) => typeof p?.stock === 'number';
+
 // Push после изменения товара: подключённым — новинка/поступление/цена, владельцу — «заканчивается»
 async function pushProduct(sellerId, s, before, after) {
   if (!after) return;
@@ -131,13 +133,13 @@ async function pushProduct(sellerId, s, before, after) {
   const tag = `p-${after.id}`;
   const jobs = [];
   if (!before) {
-    jobs.push(notify(viewers, `Новый товар · ${s.name}`, `${after.name} — ${money(after.price)}, в наличии ${after.stock}`, tag));
-  } else if (after.stock > before.stock) {
+    jobs.push(notify(viewers, `Новый товар · ${s.name}`, `${after.name} — ${money(after.price)}${hasStock(after) ? `, в наличии ${after.stock}` : ''}`, tag));
+  } else if (hasStock(after) && hasStock(before) && after.stock > before.stock) {
     jobs.push(notify(viewers, `Поступление · ${s.name}`, `${after.name}: +${r3(after.stock - before.stock)}, всего ${after.stock}. Цена ${money(after.price)}`, tag));
   } else if (after.price !== before.price) {
     jobs.push(notify(viewers, `Новая цена · ${s.name}`, `${after.name}: ${money(before.price)} → ${money(after.price)}`, tag));
   }
-  if (before && after.stock <= LOW_STOCK && before.stock > LOW_STOCK) {
+  if (hasStock(after) && hasStock(before) && after.stock <= LOW_STOCK && before.stock > LOW_STOCK) {
     jobs.push(notify([sellerId], after.stock <= 0 ? 'Товар закончился' : 'Товар заканчивается', `${after.name}: осталось ${after.stock}`, `low-${after.id}`));
   }
   try { await Promise.all(jobs); } catch (e) { console.error('push', e); }
@@ -224,7 +226,7 @@ const SELLER = {
   async product(u, b) {
     const name = str(b.name, 'название');
     const price = num(b.price, 'цена');
-    const stock = r3(num(b.stock ?? 0, 'остаток'));
+    const stock = b.stock == null || b.stock === '' ? null : r3(num(b.stock, 'остаток'));
     const cost = num(b.cost || 0, 'цена закупа');
     const d = date(b.date);
     const pid = newId();
@@ -247,7 +249,7 @@ const SELLER = {
     const pid = id(b.id);
     const name = str(b.name, 'название');
     const price = num(b.price, 'цена');
-    const stock = r3(num(b.stock, 'остаток'));
+    const newStock = b.stock == null || b.stock === '' ? undefined : r3(num(b.stock, 'остаток'));
     let before;
     const s = await update(sk(u.uid), (cur) => {
       const p = cur.products[pid] || bad('Товар не найден', 404);
@@ -255,7 +257,8 @@ const SELLER = {
         bad('Товар с таким названием уже есть');
       }
       before = { ...p };
-      Object.assign(p, { name, price, stock, updatedAt: Date.now() });
+      Object.assign(p, { name, price, updatedAt: Date.now() });
+      if (newStock !== undefined) p.stock = newStock;
       return cur;
     });
     await pushProduct(u.uid, s, before, s.products[pid]);
@@ -290,7 +293,7 @@ const SELLER = {
     const delta = op.type === 'sale' ? op.qty : -op.qty;
     const s = await update(sk(u.uid), (cur) => {
       const p = cur.products[op.productId];
-      if (!p) return undefined; // товар удалён — просто убираем запись
+      if (!p || !hasStock(p)) return undefined; // товар удалён или остатки не ведутся — просто убираем запись
       if (p.stock + delta < 0) bad('Нельзя отменить: остаток станет меньше нуля');
       p.stock = r3(p.stock + delta);
       p.updatedAt = Date.now();
@@ -334,10 +337,12 @@ async function move(u, b, type) {
     const p = cur.products[pid] || bad('Товар не найден (удалён?)', 404);
     before = { ...p };
     if (type === 'sale') {
-      if (qty > p.stock) bad(`Недостаточно «${p.name}»: остаток ${p.stock}`);
-      p.stock = r3(p.stock - qty);
+      if (hasStock(p)) {
+        if (qty > p.stock) bad(`Недостаточно «${p.name}»: остаток ${p.stock}`);
+        p.stock = r3(p.stock - qty);
+      }
     } else {
-      p.stock = r3(p.stock + qty);
+      p.stock = r3((hasStock(p) ? p.stock : 0) + qty);
       p.cost = price;
       if (b.price != null && b.price !== '') p.price = num(b.price, 'цена продажи');
     }
