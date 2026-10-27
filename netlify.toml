@@ -1,0 +1,14 @@
+# Настройки Netlify — менять ничего не нужно
+[build]
+  publish = "public"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  external_node_modules = ["firebase-admin"]
+
+# service worker всегда свежий, чтобы обновления доходили до телефонов
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"
