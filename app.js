@@ -1,4 +1,4 @@
-// Склад — PWA: товары, цены, остатки, продажи, закуп, доступ по коду, push.
+// Склад — PWA: товары, цены, продажи, отчёт за день, доступ по коду, push.
 // Без регистрации: имя + название магазина (или код). Сервер — Netlify Functions (/api/*).
 
 /* ------------------------------------------------------------------ */
@@ -17,6 +17,8 @@ const ymd = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${p
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
 const cleanCode = (v) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const LOW_STOCK = 5;
+// Остатки (количество) и закуп пока выключены. Чтобы включить — поставьте true.
+const STOCK = false;
 
 const ls = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
@@ -122,7 +124,7 @@ function titleFor(view) {
   return {
     start: 'Склад',
     products: S.shop?.name || 'Мой магазин',
-    report: 'Продажи и закуп за день',
+    report: STOCK ? 'Продажи и закуп за день' : 'Продажи за день',
     catalog: 'Магазины',
     profile: 'Профиль',
   }[view] || 'Склад';
@@ -354,8 +356,7 @@ function renderAll() {
 function applyOp(op, list) {
   const p = list.find((x) => x.id === op.id);
   if (!p) return;
-  if (op.kind === 'sale') p.stock = r3(p.stock - op.qty);
-  else { p.stock = r3(p.stock + op.qty); p.cost = op.cost; if (op.price != null) p.price = op.price; }
+  if (op.kind === 'sale') { if (p.stock != null) p.stock = r3(p.stock - op.qty); } else { p.stock = r3(num(p.stock) + op.qty); p.cost = op.cost; if (op.price != null) p.price = op.price; }
 }
 
 function derive() {
@@ -406,23 +407,23 @@ function renderProducts() {
   if (!S.shop) return;
   const q = $('#q').value.trim().toLowerCase();
   const list = S.products.filter((p) => !q || p.name.toLowerCase().includes(q));
-  const value = S.products.reduce((s, p) => s + num(p.stock) * num(p.price), 0);
+  const value = S.products.reduce((sum, p) => sum + num(p.stock) * num(p.price), 0);
   const low = S.products.filter((p) => num(p.stock) <= LOW_STOCK).length;
   $('#p-stats').innerHTML = `
     <span>${S.products.length} товаров</span>
-    <span>остатки на ${money(value)}</span>
-    ${low ? `<span class="warn">заканчивается: ${low}</span>` : ''}
+    ${STOCK ? `<span>остатки на ${money(value)}</span>` : ''}
+    ${STOCK && low ? `<span class="warn">заканчивается: ${low}</span>` : ''}
     ${S.outbox.length ? `<span class="warn">⏳ не отправлено: ${S.outbox.length}</span>` : ''}`;
   $('#p-list').innerHTML = list.length
     ? list.map((p) => `
-      <li class="item ${num(p.stock) <= 0 ? 'out' : ''}">
+      <li class="item ${STOCK && num(p.stock) <= 0 ? 'out' : ''}">
         <div class="info">
           <b>${esc(p.name)}</b>
-          <small>${money(p.price)} · <span class="${num(p.stock) <= LOW_STOCK ? 'warn' : ''}">остаток ${qtyFmt(p.stock)}</span></small>
+          <small>${money(p.price)}${STOCK ? ` · <span class="${num(p.stock) <= LOW_STOCK ? 'warn' : ''}">остаток ${qtyFmt(p.stock)}</span>` : ''}</small>
         </div>
         <div class="acts">
           <button type="button" class="btn sm primary" data-act="sell" data-id="${p.id}">Продажа</button>
-          <button type="button" class="btn sm" data-act="buy" data-id="${p.id}">Закуп</button>
+          ${STOCK ? `<button type="button" class="btn sm" data-act="buy" data-id="${p.id}">Закуп</button>` : ''}
           <button type="button" class="btn sm ghost" data-act="edit" data-id="${p.id}" aria-label="Изменить">✎</button>
         </div>
       </li>`).join('')
@@ -445,8 +446,10 @@ $('#add-product').onclick = () => form({
   fields: [
     { name: 'name', label: 'Название', required: true, value: $('#q').value.trim() },
     { name: 'price', label: 'Цена продажи, ₸', type: 'number', min: 0, required: true },
-    { name: 'stock', label: 'Остаток сейчас', type: 'number', min: 0, value: 0 },
-    { name: 'cost', label: 'Цена закупа за шт., ₸ (необязательно)', type: 'number', min: 0 },
+    ...(STOCK ? [
+      { name: 'stock', label: 'Остаток сейчас', type: 'number', min: 0, value: 0 },
+      { name: 'cost', label: 'Цена закупа за шт., ₸ (необязательно)', type: 'number', min: 0 },
+    ] : []),
   ],
   hint: (v) => (num(v.stock) > 0 && num(v.cost) > 0
     ? `Будет записан закуп на ${money(num(v.stock) * num(v.cost))}` : ''),
@@ -454,7 +457,7 @@ $('#add-product').onclick = () => form({
     const name = v.name.trim();
     if (!name) throw new Error('Введите название');
     const res = await api('product', {
-      name, price: num(v.price), stock: num(v.stock), cost: num(v.cost), date: ymd(), at: Date.now(),
+      name, price: num(v.price), ...(STOCK ? { stock: num(v.stock), cost: num(v.cost) } : {}), date: ymd(), at: Date.now(),
     }).catch(needNet);
     applySeller(res);
     $('#q').value = '';
@@ -468,7 +471,7 @@ function sellDialog(p) {
     title: `Продажа: ${p.name}`,
     submit: 'Продать',
     fields: [
-      { name: 'qty', label: `Количество (в наличии ${qtyFmt(p.stock)})`, type: 'number', min: 0, value: 1, required: true },
+      { name: 'qty', label: STOCK && p.stock != null ? `Количество (в наличии ${qtyFmt(p.stock)})` : 'Количество', type: 'number', min: 0, value: 1, required: true },
       { name: 'price', label: 'Цена за шт., ₸', type: 'number', min: 0, value: p.price, required: true },
     ],
     hint: (v) => `Сумма: ${money(num(v.qty) * num(v.price))}`,
@@ -477,7 +480,7 @@ function sellDialog(p) {
       const cur = S.products.find((x) => x.id === p.id);
       if (!cur) throw new Error('Товар удалён');
       if (qty <= 0) throw new Error('Укажите количество');
-      if (qty > num(cur.stock)) throw new Error(`Недостаточно товара: остаток ${qtyFmt(cur.stock)}`);
+      if (STOCK && cur.stock != null && qty > num(cur.stock)) throw new Error(`Недостаточно товара: остаток ${qtyFmt(cur.stock)}`);
       queue({ kind: 'sale', opId: uid(), id: cur.id, name: cur.name, qty, price, date: ymd(), at: Date.now() });
       toast(`Продано: ${cur.name} × ${qtyFmt(qty)} = ${money(qty * price)}`);
     },
@@ -514,11 +517,11 @@ function editDialog(p) {
     fields: [
       { name: 'name', label: 'Название', value: p.name, required: true },
       { name: 'price', label: 'Цена продажи, ₸', type: 'number', min: 0, value: p.price, required: true },
-      { name: 'stock', label: 'Остаток (корректировка, без записи в отчёт)', type: 'number', min: 0, value: p.stock, required: true },
+      ...(STOCK ? [{ name: 'stock', label: 'Остаток (корректировка, без записи в отчёт)', type: 'number', min: 0, value: p.stock ?? 0, required: true }] : []),
     ],
     onSubmit: async (v) => {
       if (S.outbox.some((o) => o.id === p.id)) throw new Error('Дождитесь отправки операций по этому товару');
-      const res = await api('edit', { id: p.id, name: v.name, price: num(v.price), stock: num(v.stock) }).catch(needNet);
+      const res = await api('edit', { id: p.id, name: v.name, price: num(v.price), ...(STOCK ? { stock: num(v.stock) } : {}) }).catch(needNet);
       applySeller(res);
       toast('Сохранено');
     },
@@ -583,7 +586,11 @@ function renderReport() {
   const sum = (a) => a.reduce((s, o) => s + num(o.total), 0);
   const sS = sum(sales); const sB = sum(buys);
 
-  $('#r-kpis').innerHTML = `
+  const soldQty = sales.reduce((s, o) => s + num(o.qty), 0);
+  $('#r-kpis').innerHTML = !STOCK ? `
+    <div class="kpi sale"><small>Продажи</small><b>${money(sS)}</b><small>за день</small></div>
+    <div class="kpi"><small>Продаж</small><b>${sales.length}</b><small>операций</small></div>
+    <div class="kpi"><small>Продано</small><b>${qtyFmt(soldQty)}</b><small>шт.</small></div>` : `
     <div class="kpi sale"><small>Продажи</small><b>${money(sS)}</b><small>${sales.length} опер.</small></div>
     <div class="kpi buy"><small>Закуп</small><b>${money(sB)}</b><small>${buys.length} опер.</small></div>
     <div class="kpi"><small>Разница</small><b class="${sS - sB < 0 ? 'neg' : ''}">${money(sS - sB)}</b><small>продажи − закуп</small></div>`;
@@ -595,7 +602,11 @@ function renderReport() {
     byItem.set(o.productName, r);
   }
   const rows = [...byItem.entries()].sort((a, b) => b[1].ss - a[1].ss);
-  $('#r-items').innerHTML = rows.length ? `
+  $('#r-items').innerHTML = rows.length && !STOCK ? `
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr><th>Товар</th><th>Кол-во</th><th>Сумма</th></tr></thead>
+      <tbody>${rows.map(([n, r]) => `<tr><td>${esc(n)}</td><td>${qtyFmt(r.sq)}</td><td>${money(r.ss)}</td></tr>`).join('')}</tbody>
+    </table></div>` : rows.length ? `
     <div class="tbl-wrap"><table class="tbl">
       <thead><tr><th>Товар</th><th>Продано</th><th>Закуп</th></tr></thead>
       <tbody>${rows.map(([n, r]) => `<tr><td>${esc(n)}</td>
@@ -621,7 +632,7 @@ $('#r-ops').addEventListener('click', async (e) => {
   if (!btn) return;
   const o = reportOps().find((x) => x.id === btn.dataset.cancel);
   if (!o) return;
-  if (!confirm(`Отменить ${o.type === 'sale' ? 'продажу' : 'закуп'} «${o.productName}» × ${qtyFmt(o.qty)}? Остаток будет исправлен.`)) return;
+  if (!confirm(`Отменить ${o.type === 'sale' ? 'продажу' : 'закуп'} «${o.productName}» × ${qtyFmt(o.qty)}?${STOCK ? ' Остаток будет исправлен.' : ''}`)) return;
   if (o.pending) {
     S.outbox = S.outbox.filter((x) => x.opId !== o.id);
     ls.set('sk_outbox', S.outbox);
@@ -643,7 +654,7 @@ $('#r-ops').addEventListener('click', async (e) => {
 /* ------------------------------------------------------------------ */
 const fmtKey = (k) => (k ? `${k.slice(0, 4)}-${k.slice(4)}` : '');
 const joinLink = (code) => `${location.origin}${location.pathname}?join=${code}`;
-const shareText = (name, code) => `Магазин «${name}»: смотрите товары, цены и остатки.\nКод для подключения: ${code}`;
+const shareText = (name, code) => `Магазин «${name}»: смотрите товары и цены.\nКод для подключения: ${code}`;
 
 function renderProfile() {
   if (!S.me) return;
@@ -655,21 +666,21 @@ function renderProfile() {
     const link = joinLink(code);
     $('#pr-shop').innerHTML = `
       <h3>${esc(S.shop.name)}</h3>
-      <p class="muted">Владелец: ${esc(S.me.name)}. Дайте этот код тем, кто должен видеть ваши товары, цены и остатки.</p>
+      <p class="muted">Владелец: ${esc(S.me.name)}. Дайте этот код тем, кто должен видеть ваши товары и цены.</p>
       <div class="code">${esc(code)}</div>
       <div class="share">
         <a class="btn wa" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(`${text}\n${link}`)}">WhatsApp</a>
         <a class="btn tg" target="_blank" rel="noopener" href="https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}">Telegram</a>
         <button type="button" class="btn" id="code-share">${navigator.share ? 'Ещё…' : 'Копировать'}</button>
       </div>
-      <p class="muted">Продажи, закуп, отчёты и цены закупа видите только вы.</p>
+      <p class="muted">${STOCK ? 'Продажи, закуп, отчёты и цены закупа видите только вы.' : 'Продажи и отчёты видите только вы.'}</p>
       <button type="button" class="btn ghost sm" id="code-new">Сменить код</button>`;
     $('#code-share').onclick = () => shareCode(text, link);
     $('#code-new').onclick = newCode;
   } else {
     $('#pr-shop').innerHTML = `
       <h3>Свой магазин</h3>
-      <p class="muted">Откройте свой магазин: добавляйте товары, отмечайте продажи и закуп, давайте код другим.</p>
+      <p class="muted">Откройте свой магазин: добавляйте товары и цены, отмечайте продажи, давайте код другим.</p>
       <button type="button" class="btn primary" id="shop-open">Открыть свой магазин</button>`;
     $('#shop-open').onclick = openShopDialog;
   }
@@ -818,13 +829,13 @@ function renderCatalog() {
       rows.push({ ...p, shop: s.name });
     }
   }
-  rows.sort((a, b) => (num(b.stock) > 0) - (num(a.stock) > 0) || a.name.localeCompare(b.name, 'ru'));
+  rows.sort((a, b) => (STOCK ? (num(b.stock) > 0) - (num(a.stock) > 0) : 0) || a.name.localeCompare(b.name, 'ru'));
   const closed = S.joined.filter((s) => !s.access).map((s) => esc(s.name)).join(', ');
   $('#c-list').innerHTML = (rows.length
     ? rows.map((p) => `
-      <li class="item ${num(p.stock) <= 0 ? 'out' : ''}">
+      <li class="item ${STOCK && num(p.stock) <= 0 ? 'out' : ''}">
         <div class="info"><b>${esc(p.name)}</b>
-          <small>${esc(p.shop)} · ${num(p.stock) > 0 ? `в наличии ${qtyFmt(p.stock)}` : 'нет в наличии'}</small></div>
+          <small>${esc(p.shop)}${STOCK ? ` · ${num(p.stock) > 0 ? `в наличии ${qtyFmt(p.stock)}` : 'нет в наличии'}` : ''}</small></div>
         <div class="price">${money(p.price)}</div>
       </li>`).join('')
     : `<li class="empty">${q ? 'Ничего не найдено' : 'В магазине пока нет товаров'}</li>`)
@@ -838,8 +849,8 @@ const pushSupported = 'serviceWorker' in navigator && 'PushManager' in window &&
 
 function renderPush() {
   const what = [
-    S.shop ? 'когда ваш товар заканчивается и итоги дня в 21:00' : '',
-    'новые товары, поступления и смена цен в магазинах, к которым вы подключены',
+    S.shop ? (STOCK ? 'когда ваш товар заканчивается и итоги дня в 21:00' : 'итоги продаж за день в 21:00') : '',
+    STOCK ? 'новые товары, поступления и смена цен в магазинах, к которым вы подключены' : 'новые товары и смена цен в магазинах, к которым вы подключены',
   ].filter(Boolean).join('; ');
   let st;
   if (!pushSupported) st = 'Этот браузер не поддерживает push. На iPhone: «Поделиться» → «На экран Домой», затем откройте приложение с иконки.';
