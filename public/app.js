@@ -1,17 +1,5 @@
 // Склад — PWA: товары, цены, остатки, продажи, закуп, доступ магазинов по коду, push.
-import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
-import {
-  getAuth, onAuthStateChanged, signInWithEmailAndPassword,
-  createUserWithEmailAndPassword, signOut,
-} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-import {
-  initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  doc, getDoc, setDoc, collection, onSnapshot, query, where,
-  writeBatch, serverTimestamp, increment,
-} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
-import {
-  getMessaging, getToken, onMessage, isSupported,
-} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
+// Сервер — Netlify Functions (/api/*), данные — Netlify Blobs.
 
 /* ------------------------------------------------------------------ */
 /*  Утилиты                                                            */
@@ -23,10 +11,17 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
 const money = (n) => Number(n || 0).toLocaleString('ru-RU', { maximumFractionDigits: 2 }) + ' ₸';
 const qtyFmt = (n) => Number(n || 0).toLocaleString('ru-RU', { maximumFractionDigits: 3 });
 const num = (v) => { const n = parseFloat(String(v ?? '').replace(',', '.')); return Number.isFinite(n) ? n : 0; };
+const r3 = (n) => Math.round(n * 1000) / 1000;
 const pad = (n) => String(n).padStart(2, '0');
 const ymd = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
 const LOW_STOCK = 5;
-const CODE_ABC = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+const ls = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* память переполнена */ } },
+  del(k) { try { localStorage.removeItem(k); } catch { /* */ } },
+};
 
 function toast(msg) {
   const t = $('#toast');
@@ -36,35 +31,51 @@ function toast(msg) {
   toast.timer = setTimeout(() => t.classList.remove('show'), 3200);
 }
 
-// Запись сразу видна в интерфейсе (локальный кэш), а на сервер уходит,
-// как только появится интернет — поэтому продавать можно и офлайн.
-function commit(batch, okMsg, after) {
-  batch.commit().then(after).catch((e) => toast('Не сохранилось: ' + e.message));
-  if (okMsg) toast(okMsg);
-}
+/* ------------------------------------------------------------------ */
+/*  Состояние                                                          */
+/* ------------------------------------------------------------------ */
+const S = {
+  token: ls.get('sk_token'),
+  me: null,
+  // продавец
+  base: [],       // товары, как их знает сервер
+  products: [],   // base + ещё не отправленные операции
+  viewers: [], code: '',
+  outbox: ls.get('sk_outbox') || [],
+  ops: [], date: ymd(), opsLoaded: false,
+  // магазин
+  sellers: [], filter: 'all',
+  view: 'auth', started: false,
+};
 
-// Сообщить серверу (Netlify Function) об изменении товара, чтобы он разослал push.
-// Вызываем только когда уведомление действительно нужно — экономим лимиты.
-function pushEvent({ productId, isNew = false, prevStock = 0, prevPrice = null, newStock, newPrice }) {
-  const toStores = S.viewers.length > 0
-    && (isNew || newStock > prevStock || (prevPrice != null && newPrice !== prevPrice));
-  const toMe = !isNew && newStock <= LOW_STOCK && prevStock > LOW_STOCK;
-  if (!toStores && !toMe) return undefined;
-  return async () => {
-    try {
-      const token = await auth.currentUser.getIdToken();
-      await fetch('/.netlify/functions/notify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-        body: JSON.stringify({ productId, isNew, prevStock, prevPrice }),
-      });
-    } catch (e) { console.warn('push', e); }
-  };
-}
-
-function genCode() {
-  const r = crypto.getRandomValues(new Uint32Array(6));
-  return Array.from(r, (x) => CODE_ABC[x % CODE_ABC.length]).join('');
+/* ------------------------------------------------------------------ */
+/*  Сервер                                                             */
+/* ------------------------------------------------------------------ */
+async function api(action, body, params) {
+  const qs = params ? '?' + new URLSearchParams(params) : '';
+  let res;
+  try {
+    res = await fetch(`/api/${action}${qs}`, {
+      method: body ? 'POST' : 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    const e = new Error('Нет интернета');
+    e.offline = true;
+    throw e;
+  }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && S.token) { logout(true); }
+  if (!res.ok) {
+    const e = new Error(data.error || `Ошибка ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return data;
 }
 
 /* ------------------------------------------------------------------ */
@@ -72,10 +83,16 @@ function genCode() {
 /* ------------------------------------------------------------------ */
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'push') {
+      toast(`${e.data.title}: ${e.data.body}`);
+      refresh();
+    }
+  });
 }
 
 const setNet = () => { $('#net').textContent = navigator.onLine ? '' : 'офлайн'; };
-addEventListener('online', setNet);
+addEventListener('online', () => { setNet(); flush(); refresh(); });
 addEventListener('offline', setNet);
 setNet();
 
@@ -85,56 +102,12 @@ addEventListener('beforeinstallprompt', (e) => {
   installPrompt = e;
   $('#install-card').hidden = false;
 });
-$('#install').onclick = async () => {
+$('#install').onclick = () => {
   if (!installPrompt) return;
   installPrompt.prompt();
   installPrompt = null;
   $('#install-card').hidden = true;
 };
-
-/* ------------------------------------------------------------------ */
-/*  Firebase                                                           */
-/* ------------------------------------------------------------------ */
-const cfg = self.FIREBASE_CONFIG || {};
-if (!cfg.apiKey || cfg.apiKey.startsWith('ВСТАВЬТЕ')) {
-  $('main').innerHTML = `<div class="card setup">
-    <h3>Почти готово</h3>
-    <p>Откройте файл <b>firebase-config.js</b> и вставьте настройки вашего проекта Firebase.
-    Пошаговая инструкция — в <b>README.md</b>.</p></div>`;
-  throw new Error('firebase-config.js не заполнен');
-}
-
-const fbApp = initializeApp(cfg);
-const auth = getAuth(fbApp);
-const db = initializeFirestore(fbApp, {
-  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
-});
-const messaging = (await isSupported().catch(() => false)) ? getMessaging(fbApp) : null;
-
-/* ------------------------------------------------------------------ */
-/*  Состояние                                                          */
-/* ------------------------------------------------------------------ */
-const S = {
-  uid: null, profile: null, seller: null,
-  products: [], ops: [], viewers: [],
-  links: [], storeProducts: {}, linkSubs: {},
-  subs: [], opsSub: null,
-  filter: 'all', date: ymd(),
-};
-
-const productsCol = () => collection(db, 'sellers', S.uid, 'products');
-const opsCol = () => collection(db, 'sellers', S.uid, 'transactions');
-const pRef = (id) => doc(db, 'sellers', S.uid, 'products', id);
-
-function stopAll() {
-  S.subs.forEach((u) => u());
-  Object.values(S.linkSubs).forEach((u) => u());
-  S.opsSub?.();
-  Object.assign(S, {
-    profile: null, seller: null, products: [], ops: [], viewers: [],
-    links: [], storeProducts: {}, linkSubs: {}, subs: [], opsSub: null, filter: 'all',
-  });
-}
 
 /* ------------------------------------------------------------------ */
 /*  Навигация                                                          */
@@ -149,10 +122,12 @@ const TITLES = {
 };
 
 function show(view) {
+  S.view = view;
   $$('.view').forEach((v) => v.classList.toggle('on', v.id === 'v-' + view));
   $$('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.view === view));
   $('#title').textContent = TITLES[view] || 'Склад';
   scrollTo(0, 0);
+  if (view === 'report') loadOps();
 }
 
 function buildTabs(role) {
@@ -191,16 +166,19 @@ function form({ title, fields, submit = 'Сохранить', hint, onSubmit, ex
     </div>`;
   const values = () => Object.fromEntries(new FormData(f));
   const upd = () => { $('#dlg-hint').textContent = hint ? hint(values()) : ''; };
+  const busy = (on) => f.querySelectorAll('button').forEach((b) => { b.disabled = on; });
   f.oninput = upd;
   upd();
   f.onsubmit = async (e) => {
     e.preventDefault();
-    try { await onSubmit(values()); dlg.close(); } catch (err) { $('#dlg-err').textContent = err.message; }
+    busy(true);
+    try { await onSubmit(values()); dlg.close(); } catch (err) { $('#dlg-err').textContent = err.message; } finally { busy(false); }
   };
   $('#dlg-cancel').onclick = () => dlg.close();
   if (extra) {
     $('#dlg-extra').onclick = async () => {
-      try { if (await extra.onClick()) dlg.close(); } catch (err) { $('#dlg-err').textContent = err.message; }
+      busy(true);
+      try { if (await extra.onClick()) dlg.close(); } catch (err) { $('#dlg-err').textContent = err.message; } finally { busy(false); }
     };
   }
   dlg.showModal();
@@ -211,27 +189,14 @@ function form({ title, fields, submit = 'Сохранить', hint, onSubmit, ex
 /*  Вход и регистрация                                                 */
 /* ------------------------------------------------------------------ */
 let authMode = 'login';
-function setAuthMode(mode, note = '') {
+function setAuthMode(mode) {
   authMode = mode;
   $$('[data-auth]').forEach((x) => x.classList.toggle('on', x.dataset.auth === mode));
   $('#f-auth').classList.toggle('register', mode === 'register');
   $('#f-auth [type=submit]').textContent = mode === 'login' ? 'Войти' : 'Создать аккаунт';
-  $('#auth-note').textContent = note;
   $('#auth-err').textContent = '';
 }
 $$('[data-auth]').forEach((b) => { b.onclick = () => setAuthMode(b.dataset.auth); });
-
-const AUTH_ERR = {
-  'auth/invalid-credential': 'Неверный email или пароль',
-  'auth/wrong-password': 'Неверный пароль',
-  'auth/user-not-found': 'Пользователь не найден',
-  'auth/email-already-in-use': 'Этот email уже зарегистрирован — войдите',
-  'auth/weak-password': 'Пароль — минимум 6 символов',
-  'auth/invalid-email': 'Неверный email',
-  'auth/network-request-failed': 'Нет интернета',
-  'auth/too-many-requests': 'Слишком много попыток, подождите',
-  name: 'Укажите название',
-};
 
 $('#f-auth').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -240,106 +205,153 @@ $('#f-auth').addEventListener('submit', async (e) => {
   btn.disabled = true;
   $('#auth-err').textContent = '';
   try {
-    if (authMode === 'login') {
-      await signInWithEmailAndPassword(auth, f.get('email').trim(), f.get('password'));
-    } else {
-      const name = String(f.get('name') || '').trim();
-      if (!name) throw { code: 'name' };
-      const data = { role: f.get('role'), name };
-      // Аккаунт уже есть, но профиль не создан (например, оборвался интернет)
-      const user = auth.currentUser
-        || (await createUserWithEmailAndPassword(auth, f.get('email').trim(), f.get('password'))).user;
-      await createProfile(user, data);
-    }
+    const body = { email: f.get('email'), password: f.get('password') };
+    if (authMode === 'register') Object.assign(body, { name: f.get('name'), role: f.get('role') });
+    const { token } = await api(authMode, body);
+    S.token = token;
+    ls.set('sk_token', token);
+    e.target.reset();
+    await boot();
   } catch (err) {
-    $('#auth-err').textContent = AUTH_ERR[err.code] || err.message || 'Ошибка';
+    $('#auth-err').textContent = err.message;
   } finally {
     btn.disabled = false;
   }
 });
 
-async function freeCode() {
-  for (let i = 0; i < 10; i++) {
-    const c = genCode();
-    if (!(await getDoc(doc(db, 'codes', c))).exists()) return c;
-  }
-  throw new Error('Не удалось создать код, попробуйте ещё раз');
-}
+$('#logout').onclick = () => {
+  const pending = S.outbox.length ? `\nВнимание: ${S.outbox.length} операций ещё не отправлены и пропадут.` : '';
+  if (confirm('Выйти из аккаунта?' + pending)) logout();
+};
 
-async function createProfile(user, { role, name }) {
-  const b = writeBatch(db);
-  b.set(doc(db, 'users', user.uid), { role, name, email: user.email, createdAt: serverTimestamp() });
-  if (role === 'seller') {
-    const code = await freeCode();
-    b.set(doc(db, 'sellers', user.uid), { name, code, createdAt: serverTimestamp() });
-    b.set(doc(db, 'codes', code), { sellerId: user.uid, sellerName: name });
-  }
-  await b.commit();
-}
-
-onAuthStateChanged(auth, (user) => {
-  stopAll();
-  delete document.body.dataset.role;
-  if (!user) {
-    S.uid = null;
-    buildTabs(null);
-    setAuthMode(authMode);
-    show('auth');
-    return;
-  }
-  S.uid = user.uid;
-  let started = false;
-  S.subs.push(onSnapshot(doc(db, 'users', user.uid), (snap) => {
-    if (!snap.exists()) {
-      // Профиль ещё создаётся — или не был создан. Во втором случае просим дозаполнить.
-      if (!snap.metadata.fromCache && !snap.metadata.hasPendingWrites) {
-        setAuthMode('register', 'Аккаунт есть, но профиль не заполнен. Выберите роль и название.');
-        show('auth');
-      }
-      return;
+async function logout(expired = false) {
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    const sub = await reg?.pushManager?.getSubscription();
+    if (sub && !expired) {
+      await api('unsubscribe', { endpoint: sub.endpoint }).catch(() => {});
+      await sub.unsubscribe();
     }
-    S.profile = snap.data();
-    if (!started) { started = true; startApp(); }
-    renderProfile();
-  }, (err) => toast(err.message)));
-});
+  } catch { /* */ }
+  ['sk_token', 'sk_state', 'sk_outbox'].forEach(ls.del);
+  location.reload();
+}
 
-$('#logout').onclick = () => { if (confirm('Выйти из аккаунта?')) signOut(auth); };
-
-function startApp() {
-  const role = S.profile.role;
-  document.body.dataset.role = role;
-  buildTabs(role);
-
-  if (role === 'seller') {
-    S.subs.push(onSnapshot(productsCol(), (snap) => {
-      S.products = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
-        .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
-      renderProducts();
-    }, (err) => toast(err.message)));
-    S.subs.push(onSnapshot(doc(db, 'sellers', S.uid), (snap) => {
-      S.seller = snap.data() || null;
-      renderProfile();
-    }));
-    S.subs.push(onSnapshot(collection(db, 'sellers', S.uid, 'viewers'), (snap) => {
-      S.viewers = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      renderProfile();
-    }));
-    subscribeOps();
-    show('products');
-  } else {
-    S.subs.push(onSnapshot(collection(db, 'users', S.uid, 'links'), (snap) => {
-      S.links = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
-        .sort((a, b) => (a.sellerName || '').localeCompare(b.sellerName || '', 'ru'));
-      syncLinkSubs();
-      renderSellers();
-      renderCatalog();
-    }, (err) => toast(err.message)));
-    show('catalog');
+/* ------------------------------------------------------------------ */
+/*  Запуск и обновление данных                                         */
+/* ------------------------------------------------------------------ */
+async function boot() {
+  if (!S.token) { buildTabs(null); setAuthMode(authMode); show('auth'); return; }
+  const cached = ls.get('sk_state');
+  if (cached?.me) applyState(cached);
+  await refresh();
+  if (!S.me) {
+    // нет ни кэша, ни связи
+    $('#auth-err').textContent = 'Нет связи с сервером. Проверьте интернет и обновите страницу.';
+    show('auth');
   }
+}
 
+async function refresh() {
+  if (!S.token) return;
+  try {
+    const st = await api('state');
+    ls.set('sk_state', st);
+    applyState(st);
+  } catch (e) {
+    if (!e.offline && e.status !== 401) toast(e.message);
+  }
+}
+
+function applyState(st) {
+  S.me = st.me;
+  if (st.me.role === 'seller') applySeller(st);
+  else { S.sellers = st.sellers || []; if (S.filter !== 'all' && !S.sellers.some((x) => x.id === S.filter)) S.filter = 'all'; }
+  if (!S.started) startUI();
+  renderAll();
+}
+
+function applySeller(v) {
+  S.base = v.products || [];
+  S.viewers = v.viewers || [];
+  S.code = v.code || '';
+  derive();
+  // кэшируем свежую версию для офлайна
+  const st = ls.get('sk_state');
+  if (st?.me) ls.set('sk_state', { ...st, ...v });
+}
+
+function startUI() {
+  S.started = true;
+  document.body.dataset.role = S.me.role;
+  buildTabs(S.me.role);
+  show(S.me.role === 'seller' ? 'products' : 'catalog');
   renderPush();
-  if (messaging && Notification.permission === 'granted') registerPush(true);
+  if (pushSupported && Notification.permission === 'granted') registerPush(true);
+  flush();
+  // обновляем каждые 30 секунд, пока приложение открыто
+  setInterval(() => {
+    if (document.visibilityState !== 'visible' || !navigator.onLine) return;
+    refresh();
+    if (S.view === 'report') loadOps();
+  }, 30000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { flush(); refresh(); }
+  });
+}
+
+function renderAll() {
+  renderProfile();
+  if (S.me.role === 'seller') { renderProducts(); if (S.view === 'report') renderReport(); } else { renderSellers(); renderCatalog(); }
+}
+
+/* ------------------------------------------------------------------ */
+/*  ПРОДАВЕЦ: очередь операций (продажа и закуп работают без интернета) */
+/* ------------------------------------------------------------------ */
+function applyOp(op, list) {
+  const p = list.find((x) => x.id === op.id);
+  if (!p) return;
+  if (op.kind === 'sale') p.stock = r3(p.stock - op.qty);
+  else { p.stock = r3(p.stock + op.qty); p.cost = op.cost; if (op.price != null) p.price = op.price; }
+}
+
+function derive() {
+  S.products = structuredClone(S.base);
+  S.outbox.forEach((op) => applyOp(op, S.products));
+  renderProducts();
+}
+
+function queue(op) {
+  S.outbox.push(op);
+  ls.set('sk_outbox', S.outbox);
+  derive();
+  if (S.view === 'report') renderReport();
+  flush();
+}
+
+let flushing = false;
+async function flush() {
+  if (flushing || !S.outbox.length || !S.token) return;
+  flushing = true;
+  let last = null;
+  try {
+    while (S.outbox.length) {
+      const op = S.outbox[0];
+      try {
+        last = await api(op.kind, op);
+      } catch (e) {
+        if (e.offline || !e.status || e.status >= 500 || e.status === 409 || e.status === 401) break;
+        toast(`Не принято (${op.name}): ${e.message}`);
+      }
+      S.outbox.shift();
+      ls.set('sk_outbox', S.outbox);
+    }
+  } finally {
+    flushing = false;
+  }
+  if (last) applySeller(last);
+  else derive();
+  if (S.view === 'report') loadOps();
 }
 
 /* ------------------------------------------------------------------ */
@@ -348,6 +360,7 @@ function startApp() {
 $('#q').addEventListener('input', renderProducts);
 
 function renderProducts() {
+  if (S.me?.role !== 'seller') return;
   const q = $('#q').value.trim().toLowerCase();
   const list = S.products.filter((p) => !q || p.name.toLowerCase().includes(q));
   const value = S.products.reduce((s, p) => s + num(p.stock) * num(p.price), 0);
@@ -355,7 +368,8 @@ function renderProducts() {
   $('#p-stats').innerHTML = `
     <span>${S.products.length} товаров</span>
     <span>остатки на ${money(value)}</span>
-    ${low ? `<span class="warn">заканчивается: ${low}</span>` : ''}`;
+    ${low ? `<span class="warn">заканчивается: ${low}</span>` : ''}
+    ${S.outbox.length ? `<span class="warn">⏳ не отправлено: ${S.outbox.length}</span>` : ''}`;
   $('#p-list').innerHTML = list.length
     ? list.map((p) => `
       <li class="item ${num(p.stock) <= 0 ? 'out' : ''}">
@@ -380,6 +394,8 @@ $('#p-list').addEventListener('click', (e) => {
   ({ sell: sellDialog, buy: buyDialog, edit: editDialog })[b.dataset.act](p);
 });
 
+const needNet = (e) => { throw new Error(e.offline ? 'Для этого нужен интернет' : e.message); };
+
 $('#add-product').onclick = () => form({
   title: 'Новый товар',
   submit: 'Добавить',
@@ -391,32 +407,18 @@ $('#add-product').onclick = () => form({
   ],
   hint: (v) => (num(v.stock) > 0 && num(v.cost) > 0
     ? `Будет записан закуп на ${money(num(v.stock) * num(v.cost))}` : ''),
-  onSubmit: (v) => {
+  onSubmit: async (v) => {
     const name = v.name.trim();
     if (!name) throw new Error('Введите название');
-    if (S.products.some((p) => p.name.toLowerCase() === name.toLowerCase())) {
-      throw new Error('Такой товар уже есть — используйте «Закуп»');
-    }
-    const stock = num(v.stock); const cost = num(v.cost);
-    const ref = doc(productsCol());
-    const b = writeBatch(db);
-    b.set(ref, {
-      name, price: num(v.price), stock, cost,
-      createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
-    });
-    if (stock > 0 && cost > 0) b.set(doc(opsCol()), op('purchase', { id: ref.id, name }, stock, cost));
-    commit(b, `Добавлено: ${name}`, pushEvent({ productId: ref.id, isNew: true, newStock: stock }));
+    const res = await api('product', {
+      name, price: num(v.price), stock: num(v.stock), cost: num(v.cost), date: ymd(), at: Date.now(),
+    }).catch(needNet);
+    applySeller(res);
     $('#q').value = '';
+    renderProducts();
+    toast(`Добавлено: ${name}`);
   },
 });
-
-function op(type, p, qty, price) {
-  return {
-    type, productId: p.id, productName: p.name, qty, price,
-    total: Math.round(qty * price * 100) / 100,
-    date: ymd(), createdAt: serverTimestamp(),
-  };
-}
 
 function sellDialog(p) {
   form({
@@ -433,12 +435,8 @@ function sellDialog(p) {
       if (!cur) throw new Error('Товар удалён');
       if (qty <= 0) throw new Error('Укажите количество');
       if (qty > num(cur.stock)) throw new Error(`Недостаточно товара: остаток ${qtyFmt(cur.stock)}`);
-      const b = writeBatch(db);
-      b.update(pRef(p.id), { stock: increment(-qty), updatedAt: serverTimestamp() });
-      b.set(doc(opsCol()), op('sale', cur, qty, price));
-      commit(b, `Продано: ${cur.name} × ${qtyFmt(qty)} = ${money(qty * price)}`, pushEvent({
-        productId: cur.id, prevStock: num(cur.stock), newStock: num(cur.stock) - qty,
-      }));
+      queue({ kind: 'sale', opId: uid(), id: cur.id, name: cur.name, qty, price, date: ymd(), at: Date.now() });
+      toast(`Продано: ${cur.name} × ${qtyFmt(qty)} = ${money(qty * price)}`);
     },
   });
 }
@@ -454,19 +452,15 @@ function buyDialog(p) {
     ],
     hint: (v) => (num(v.qty) > 0 ? `Закуп на ${money(num(v.qty) * num(v.cost))}, станет ${qtyFmt(num(p.stock) + num(v.qty))} шт.` : ''),
     onSubmit: (v) => {
-      const qty = num(v.qty); const cost = num(v.cost);
+      const qty = num(v.qty);
       const cur = S.products.find((x) => x.id === p.id);
       if (!cur) throw new Error('Товар удалён');
       if (qty <= 0) throw new Error('Укажите количество');
-      const b = writeBatch(db);
-      b.update(pRef(p.id), {
-        stock: increment(qty), cost, price: num(v.price), updatedAt: serverTimestamp(),
+      queue({
+        kind: 'purchase', opId: uid(), id: cur.id, name: cur.name, qty,
+        cost: num(v.cost), price: num(v.price), date: ymd(), at: Date.now(),
       });
-      b.set(doc(opsCol()), op('purchase', cur, qty, cost));
-      commit(b, `Закуп: ${cur.name} +${qtyFmt(qty)}`, pushEvent({
-        productId: cur.id, prevStock: num(cur.stock), newStock: num(cur.stock) + qty,
-        prevPrice: num(cur.price), newPrice: num(v.price),
-      }));
+      toast(`Закуп: ${cur.name} +${qtyFmt(qty)}`);
     },
   });
 }
@@ -479,23 +473,19 @@ function editDialog(p) {
       { name: 'price', label: 'Цена продажи, ₸', type: 'number', min: 0, value: p.price, required: true },
       { name: 'stock', label: 'Остаток (корректировка, без записи в отчёт)', type: 'number', min: 0, value: p.stock, required: true },
     ],
-    onSubmit: (v) => {
-      const name = v.name.trim();
-      if (!name) throw new Error('Введите название');
-      const b = writeBatch(db);
-      b.update(pRef(p.id), { name, price: num(v.price), stock: num(v.stock), updatedAt: serverTimestamp() });
-      commit(b, 'Сохранено', pushEvent({
-        productId: p.id, prevStock: num(p.stock), newStock: num(v.stock),
-        prevPrice: num(p.price), newPrice: num(v.price),
-      }));
+    onSubmit: async (v) => {
+      if (S.outbox.some((o) => o.id === p.id)) throw new Error('Дождитесь отправки операций по этому товару');
+      const res = await api('edit', { id: p.id, name: v.name, price: num(v.price), stock: num(v.stock) }).catch(needNet);
+      applySeller(res);
+      toast('Сохранено');
     },
     extra: {
       label: 'Удалить',
-      onClick: () => {
+      onClick: async () => {
         if (!confirm(`Удалить «${p.name}»? Записи в отчётах останутся.`)) return false;
-        const b = writeBatch(db);
-        b.delete(pRef(p.id));
-        commit(b, 'Товар удалён');
+        const res = await api('remove', { id: p.id }).catch(needNet);
+        applySeller(res);
+        toast('Товар удалён');
         return true;
       },
     },
@@ -505,31 +495,48 @@ function editDialog(p) {
 /* ------------------------------------------------------------------ */
 /*  ПРОДАВЕЦ: отчёт за день                                            */
 /* ------------------------------------------------------------------ */
-function subscribeOps() {
-  S.opsSub?.();
+async function loadOps() {
+  if (S.me?.role !== 'seller') return;
   $('#d-date').value = S.date;
-  S.opsSub = onSnapshot(query(opsCol(), where('date', '==', S.date)), (snap) => {
-    S.ops = snap.docs.map((d) => {
-      const data = d.data({ serverTimestamps: 'estimate' });
-      return { id: d.id, ...data, ts: data.createdAt?.toMillis?.() ?? Date.now() };
-    }).sort((a, b) => b.ts - a.ts);
-    renderReport();
-  }, (err) => toast(err.message));
+  const want = S.date;
+  try {
+    const { ops } = await api('ops', null, { date: want });
+    if (want !== S.date) return;
+    S.ops = ops;
+    ls.set('sk_ops_' + want, ops);
+  } catch {
+    S.ops = ls.get('sk_ops_' + want) || [];
+  }
+  renderReport();
 }
 
 function shiftDate(n) {
   const d = new Date(S.date + 'T12:00:00');
   d.setDate(d.getDate() + n);
   S.date = ymd(d);
-  subscribeOps();
+  S.ops = [];
+  renderReport();
+  loadOps();
 }
 $('#d-prev').onclick = () => shiftDate(-1);
 $('#d-next').onclick = () => shiftDate(1);
-$('#d-date').onchange = (e) => { S.date = e.target.value || ymd(); subscribeOps(); };
+$('#d-date').onchange = (e) => { S.date = e.target.value || ymd(); loadOps(); };
+
+function reportOps() {
+  const pending = S.outbox.filter((o) => o.date === S.date).map((o) => ({
+    id: o.opId, type: o.kind, productName: o.name, qty: o.qty,
+    price: o.kind === 'sale' ? o.price : o.cost,
+    total: Math.round(o.qty * (o.kind === 'sale' ? o.price : o.cost) * 100) / 100,
+    at: o.at, pending: true,
+  }));
+  const sent = S.ops.filter((o) => !pending.some((x) => x.id === o.id));
+  return [...pending, ...sent].sort((a, b) => b.at - a.at);
+}
 
 function renderReport() {
-  const sales = S.ops.filter((o) => o.type === 'sale');
-  const buys = S.ops.filter((o) => o.type === 'purchase');
+  const ops = reportOps();
+  const sales = ops.filter((o) => o.type === 'sale');
+  const buys = ops.filter((o) => o.type === 'purchase');
   const sum = (a) => a.reduce((s, o) => s + num(o.total), 0);
   const sS = sum(sales); const sB = sum(buys);
 
@@ -539,7 +546,7 @@ function renderReport() {
     <div class="kpi"><small>Разница</small><b class="${sS - sB < 0 ? 'neg' : ''}">${money(sS - sB)}</b><small>продажи − закуп</small></div>`;
 
   const byItem = new Map();
-  for (const o of S.ops) {
+  for (const o of ops) {
     const r = byItem.get(o.productName) || { sq: 0, ss: 0, bq: 0, bs: 0 };
     if (o.type === 'sale') { r.sq += num(o.qty); r.ss += num(o.total); } else { r.bq += num(o.qty); r.bs += num(o.total); }
     byItem.set(o.productName, r);
@@ -553,50 +560,57 @@ function renderReport() {
         <td>${r.bq ? `${money(r.bs)}<small>${qtyFmt(r.bq)} шт.</small>` : '—'}</td></tr>`).join('')}</tbody>
     </table></div>` : '<p class="empty">Нет операций за этот день</p>';
 
-  $('#r-ops').innerHTML = S.ops.map((o) => {
-    const t = new Date(o.ts);
+  $('#r-ops').innerHTML = ops.map((o) => {
+    const t = new Date(o.at);
     return `<li class="item">
       <div class="info">
         <b><span class="tag ${o.type}">${o.type === 'sale' ? 'Продажа' : 'Закуп'}</span>${esc(o.productName)}</b>
-        <small>${pad(t.getHours())}:${pad(t.getMinutes())} · ${qtyFmt(o.qty)} × ${money(o.price)}</small>
+        <small>${pad(t.getHours())}:${pad(t.getMinutes())} · ${qtyFmt(o.qty)} × ${money(o.price)}${o.pending ? ' · ⏳ не отправлено' : ''}</small>
       </div>
       <div class="price">${money(o.total)}</div>
-      <button type="button" class="btn sm ghost" data-cancel="${o.id}" aria-label="Отменить">✕</button>
+      <button type="button" class="btn sm ghost" data-cancel="${esc(o.id)}" aria-label="Отменить">✕</button>
     </li>`;
   }).join('');
 }
 
-$('#r-ops').addEventListener('click', (e) => {
+$('#r-ops').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-cancel]');
   if (!btn) return;
-  const o = S.ops.find((x) => x.id === btn.dataset.cancel);
+  const o = reportOps().find((x) => x.id === btn.dataset.cancel);
   if (!o) return;
-  const p = S.products.find((x) => x.id === o.productId);
-  const delta = o.type === 'sale' ? num(o.qty) : -num(o.qty);
-  if (p && num(p.stock) + delta < 0) return toast('Нельзя отменить: остаток станет меньше нуля');
   if (!confirm(`Отменить ${o.type === 'sale' ? 'продажу' : 'закуп'} «${o.productName}» × ${qtyFmt(o.qty)}? Остаток будет исправлен.`)) return;
-  const b = writeBatch(db);
-  if (p) b.update(pRef(p.id), { stock: increment(delta), updatedAt: serverTimestamp() });
-  b.delete(doc(opsCol(), o.id));
-  commit(b, 'Операция отменена');
+  if (o.pending) {
+    S.outbox = S.outbox.filter((x) => x.opId !== o.id);
+    ls.set('sk_outbox', S.outbox);
+    derive(); renderReport();
+    toast('Операция отменена');
+    return;
+  }
+  try {
+    const res = await api('cancel', { date: S.date, opId: o.id });
+    applySeller(res);
+    S.ops = S.ops.filter((x) => x.id !== o.id);
+    renderReport();
+    toast('Операция отменена');
+  } catch (err) { toast(err.offline ? 'Для отмены нужен интернет' : err.message); }
 });
 
 /* ------------------------------------------------------------------ */
 /*  ПРОФИЛЬ                                                            */
 /* ------------------------------------------------------------------ */
 function renderProfile() {
-  if (!S.profile) return;
-  const isSeller = S.profile.role === 'seller';
+  if (!S.me) return;
+  const isSeller = S.me.role === 'seller';
   $('#pr-info').innerHTML = `
-    <b>${esc(S.profile.name)}</b>
-    <div class="muted">${isSeller ? 'Продавец' : 'Магазин'} · ${esc(S.profile.email || '')}</div>`;
+    <b>${esc(S.me.name)}</b>
+    <div class="muted">${isSeller ? 'Продавец' : 'Магазин'} · ${esc(S.me.email || '')}</div>`;
   if (!isSeller) return;
 
-  const code = S.seller?.code || '……';
+  const code = S.code || '……';
   $('#pr-code').innerHTML = `
     <h3>Код для магазинов</h3>
     <div class="code">${esc(code)}</div>
-    <p class="muted">Магазин вводит этот код и видит ваши товары, цены и остатки. Продажи и отчёты видны только вам.</p>
+    <p class="muted">Магазин вводит этот код и видит ваши товары, цены и остатки. Продажи, закуп и отчёты видны только вам.</p>
     <div class="row">
       <button type="button" class="btn ghost" id="code-new">Новый код</button>
       <button type="button" class="btn primary" id="code-share">Поделиться</button>
@@ -607,25 +621,23 @@ function renderProfile() {
   $('#pr-viewers').innerHTML = S.viewers.length
     ? S.viewers.map((v) => `
       <li class="item">
-        <div class="info"><b>${esc(v.storeName)}</b>
-          <small>${v.joinedAt?.toDate ? 'с ' + v.joinedAt.toDate().toLocaleDateString('ru-RU') : ''}</small></div>
-        <button type="button" class="btn sm danger" data-kick="${v.id}">Закрыть доступ</button>
+        <div class="info"><b>${esc(v.name)}</b>
+          <small>${v.joinedAt ? 'с ' + new Date(v.joinedAt).toLocaleDateString('ru-RU') : ''}</small></div>
+        <button type="button" class="btn sm danger" data-kick="${esc(v.id)}">Закрыть доступ</button>
       </li>`).join('')
     : '<li class="empty">Пока никто не подключился</li>';
 }
 
-$('#pr-viewers').addEventListener('click', (e) => {
+$('#pr-viewers').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-kick]');
   if (!b) return;
   const v = S.viewers.find((x) => x.id === b.dataset.kick);
-  if (!v || !confirm(`Закрыть доступ магазину «${v.storeName}»?`)) return;
-  const batch = writeBatch(db);
-  batch.delete(doc(db, 'sellers', S.uid, 'viewers', v.id));
-  commit(batch, 'Доступ закрыт');
+  if (!v || !confirm(`Закрыть доступ магазину «${v.name}»?`)) return;
+  try { applySeller(await api('kick', { storeId: v.id })); renderProfile(); toast('Доступ закрыт'); } catch (err) { toast(err.message); }
 });
 
 async function shareCode(code) {
-  const text = `Мой код продавца: ${code}\nОткройте ${location.origin + location.pathname}, зарегистрируйтесь как «Магазин» и введите код во вкладке «Продавцы».`;
+  const text = `Мой код продавца: ${code}\nОткройте ${location.origin}, зарегистрируйтесь как «Магазин» и введите код во вкладке «Продавцы».`;
   try {
     if (navigator.share) await navigator.share({ title: 'Код продавца', text });
     else { await navigator.clipboard.writeText(text); toast('Скопировано'); }
@@ -635,35 +647,18 @@ async function shareCode(code) {
 async function newCode() {
   if (!confirm('Создать новый код? Старый перестанет работать для новых магазинов. Уже подключённые останутся.')) return;
   try {
-    const code = await freeCode();
-    const b = writeBatch(db);
-    if (S.seller?.code) b.delete(doc(db, 'codes', S.seller.code));
-    b.set(doc(db, 'codes', code), { sellerId: S.uid, sellerName: S.profile.name });
-    b.update(doc(db, 'sellers', S.uid), { code });
-    await b.commit();
-    toast('Новый код: ' + code);
-  } catch (e) { toast('Нужен интернет: ' + e.message); }
+    applySeller(await api('newcode', {}));
+    renderProfile();
+    toast('Новый код: ' + S.code);
+  } catch (e) { toast(e.offline ? 'Нужен интернет' : e.message); }
 }
 
 /* ------------------------------------------------------------------ */
 /*  МАГАЗИН: продавцы и каталог                                        */
 /* ------------------------------------------------------------------ */
-function syncLinkSubs() {
-  const ids = new Set(S.links.map((l) => l.id));
-  for (const id of Object.keys(S.linkSubs)) {
-    if (!ids.has(id)) { S.linkSubs[id](); delete S.linkSubs[id]; delete S.storeProducts[id]; }
-  }
-  for (const id of ids) {
-    if (S.linkSubs[id]) continue;
-    S.linkSubs[id] = onSnapshot(collection(db, 'sellers', id, 'products'), (snap) => {
-      S.storeProducts[id] = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      renderCatalog(); renderSellers();
-    }, () => {
-      S.storeProducts[id] = null; // продавец закрыл доступ
-      renderCatalog(); renderSellers();
-    });
-  }
-  if (S.filter !== 'all' && !ids.has(S.filter)) S.filter = 'all';
+function applyStore(st) {
+  ls.set('sk_state', st);
+  applyState(st);
 }
 
 $('#f-join').addEventListener('submit', async (e) => {
@@ -672,50 +667,35 @@ $('#f-join').addEventListener('submit', async (e) => {
   const err = $('#join-err');
   err.textContent = '';
   try {
-    const snap = await getDoc(doc(db, 'codes', code));
-    if (!snap.exists()) throw new Error('Код не найден. Проверьте у продавца.');
-    const { sellerId, sellerName } = snap.data();
-    if (S.links.some((l) => l.id === sellerId && S.storeProducts[sellerId] !== null)) {
-      throw new Error(`«${sellerName}» уже подключён`);
-    }
-    const b = writeBatch(db);
-    b.set(doc(db, 'sellers', sellerId, 'viewers', S.uid), { code, storeName: S.profile.name, joinedAt: serverTimestamp() });
-    b.set(doc(db, 'users', S.uid, 'links', sellerId), { sellerName, code, joinedAt: serverTimestamp() });
-    await b.commit();
-    // Если доступ ранее закрывали — переподписаться
-    S.linkSubs[sellerId]?.(); delete S.linkSubs[sellerId]; syncLinkSubs();
+    applyStore(await api('join', { code }));
     e.target.reset();
-    toast(`Подключено: ${sellerName}`);
+    const s = S.sellers.find((x) => x.code === code);
+    toast(`Подключено: ${s?.name || code}`);
   } catch (ex) {
-    err.textContent = ex.code === 'permission-denied' ? 'Код устарел — попросите новый у продавца' : ex.message;
+    err.textContent = ex.message;
   }
 });
 
 function renderSellers() {
-  $('#s-list').innerHTML = S.links.length
-    ? S.links.map((l) => {
-      const ps = S.storeProducts[l.id];
-      const st = ps === null ? '<span class="warn">доступ закрыт</span>' : ps ? `${ps.length} товаров` : 'загрузка…';
-      return `<li class="item">
-        <div class="info"><b>${esc(l.sellerName)}</b><small>${st} · код ${esc(l.code)}</small></div>
-        <button type="button" class="btn sm" data-open="${l.id}">Товары</button>
-        <button type="button" class="btn sm ghost danger" data-unlink="${l.id}" aria-label="Отключить">✕</button>
-      </li>`;
-    }).join('')
+  $('#s-list').innerHTML = S.sellers.length
+    ? S.sellers.map((s) => `
+      <li class="item">
+        <div class="info"><b>${esc(s.name)}</b>
+          <small>${s.access ? `${s.products.length} товаров` : '<span class="warn">доступ закрыт</span>'} · код ${esc(s.code)}</small></div>
+        ${s.access ? `<button type="button" class="btn sm" data-open="${esc(s.id)}">Товары</button>` : ''}
+        <button type="button" class="btn sm ghost danger" data-unlink="${esc(s.id)}" aria-label="Отключить">✕</button>
+      </li>`).join('')
     : '<li class="empty">Введите код, который даст вам продавец</li>';
 }
 
-$('#s-list').addEventListener('click', (e) => {
+$('#s-list').addEventListener('click', async (e) => {
   const open = e.target.closest('[data-open]');
   if (open) { S.filter = open.dataset.open; renderCatalog(); show('catalog'); return; }
   const un = e.target.closest('[data-unlink]');
   if (!un) return;
-  const l = S.links.find((x) => x.id === un.dataset.unlink);
-  if (!l || !confirm(`Отключить продавца «${l.sellerName}»?`)) return;
-  const b = writeBatch(db);
-  b.delete(doc(db, 'sellers', l.id, 'viewers', S.uid));
-  b.delete(doc(db, 'users', S.uid, 'links', l.id));
-  commit(b, 'Отключено');
+  const s = S.sellers.find((x) => x.id === un.dataset.unlink);
+  if (!s || !confirm(`Отключить продавца «${s.name}»?`)) return;
+  try { applyStore(await api('unlink', { sellerId: s.id })); toast('Отключено'); } catch (err) { toast(err.message); }
 });
 
 $('#cq').addEventListener('input', renderCatalog);
@@ -725,21 +705,22 @@ $('#c-chips').addEventListener('click', (e) => {
 });
 
 function renderCatalog() {
-  if (!S.links.length) {
+  if (S.me?.role !== 'store') return;
+  if (!S.sellers.length) {
     $('#c-chips').innerHTML = '';
     $('#c-list').innerHTML = '<li class="empty">Подключите продавца по коду во вкладке «Продавцы»</li>';
     return;
   }
-  $('#c-chips').innerHTML = [['all', 'Все'], ...S.links.map((l) => [l.id, l.sellerName])]
-    .map(([id, n]) => `<button type="button" class="chip ${S.filter === id ? 'on' : ''}" data-f="${id}">${esc(n)}</button>`).join('');
+  $('#c-chips').innerHTML = [['all', 'Все'], ...S.sellers.filter((s) => s.access).map((s) => [s.id, s.name])]
+    .map(([fid, n]) => `<button type="button" class="chip ${S.filter === fid ? 'on' : ''}" data-f="${esc(fid)}">${esc(n)}</button>`).join('');
 
   const q = $('#cq').value.trim().toLowerCase();
   const rows = [];
-  for (const l of S.links) {
-    if (S.filter !== 'all' && S.filter !== l.id) continue;
-    for (const p of S.storeProducts[l.id] || []) {
-      if (q && !p.name.toLowerCase().includes(q) && !l.sellerName.toLowerCase().includes(q)) continue;
-      rows.push({ ...p, seller: l.sellerName });
+  for (const s of S.sellers) {
+    if (S.filter !== 'all' && S.filter !== s.id) continue;
+    for (const p of s.products) {
+      if (q && !p.name.toLowerCase().includes(q) && !s.name.toLowerCase().includes(q)) continue;
+      rows.push({ ...p, seller: s.name });
     }
   }
   rows.sort((a, b) => (num(b.stock) > 0) - (num(a.stock) > 0) || a.name.localeCompare(b.name, 'ru'));
@@ -754,38 +735,45 @@ function renderCatalog() {
 }
 
 /* ------------------------------------------------------------------ */
-/*  PUSH-уведомления                                                   */
+/*  PUSH-уведомления (стандартный Web Push)                            */
 /* ------------------------------------------------------------------ */
+const pushSupported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+
 function renderPush() {
-  const role = S.profile?.role;
-  const what = role === 'seller'
+  const what = S.me?.role === 'seller'
     ? 'Сигнал, когда товар заканчивается, и итоги дня в 21:00.'
     : 'Новые товары, поступления и смена цен у ваших продавцов.';
   let st;
-  if (!messaging) st = 'Этот браузер не поддерживает push. На iPhone: «Поделиться» → «На экран Домой», затем откройте приложение с иконки.';
+  if (!pushSupported) st = 'Этот браузер не поддерживает push. На iPhone: «Поделиться» → «На экран Домой», затем откройте приложение с иконки.';
   else if (Notification.permission === 'granted') st = 'Включены на этом устройстве.';
   else if (Notification.permission === 'denied') st = 'Заблокированы в настройках браузера для этого сайта.';
   else st = 'Выключены.';
   $('#push-state').textContent = `${st} ${what}`;
   const btn = $('#push-on');
-  btn.hidden = !messaging || Notification.permission === 'denied';
+  btn.hidden = !pushSupported || Notification.permission === 'denied';
   btn.textContent = Notification.permission === 'granted' ? 'Обновить подписку' : 'Включить уведомления';
+}
+
+function b64ToBytes(b64) {
+  const s = atob((b64 + '='.repeat((4 - (b64.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(s, (c) => c.charCodeAt(0));
 }
 
 async function registerPush(silent = false) {
   try {
-    if (!messaging) throw new Error('Push не поддерживается');
+    if (!pushSupported) throw new Error('Push не поддерживается');
     if (Notification.permission !== 'granted') {
       const perm = await Notification.requestPermission();
       renderPush();
       if (perm !== 'granted') throw new Error('Разрешение не выдано');
     }
     const reg = await navigator.serviceWorker.ready;
-    const token = await getToken(messaging, { vapidKey: self.FIREBASE_VAPID_KEY, serviceWorkerRegistration: reg });
-    if (!token) throw new Error('Не удалось получить токен');
-    await setDoc(doc(db, 'users', S.uid, 'tokens', token), {
-      createdAt: serverTimestamp(), ua: navigator.userAgent.slice(0, 200),
-    });
+    const { key } = await api('vapid');
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+    }
+    await api('subscribe', { subscription: sub.toJSON() });
     if (!silent) toast('Уведомления включены');
   } catch (e) {
     if (!silent) toast(e.message);
@@ -793,9 +781,5 @@ async function registerPush(silent = false) {
 }
 $('#push-on').onclick = () => registerPush(false);
 
-if (messaging) {
-  onMessage(messaging, (p) => {
-    const d = p.data || {};
-    toast(`${d.title || 'Уведомление'}: ${d.body || ''}`);
-  });
-}
+/* ------------------------------------------------------------------ */
+boot();

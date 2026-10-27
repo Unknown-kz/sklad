@@ -1,13 +1,7 @@
-// Service worker: офлайн-кэш + приём push-уведомлений (Firebase Cloud Messaging)
-importScripts('firebase-config.js');
-importScripts(
-  'https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js',
-  'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js'
-);
-
-const CACHE = 'sklad-v1';
+// Service worker: офлайн-кэш + приём push-уведомлений
+const CACHE = 'sklad-v2';
 const ASSETS = [
-  './', 'index.html', 'styles.css', 'app.js', 'firebase-config.js', 'manifest.json',
+  './', 'index.html', 'styles.css', 'app.js', 'manifest.json',
   'icons/icon-192.png', 'icons/icon-512.png',
 ];
 
@@ -25,54 +19,35 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('fetch', (e) => {
   const req = e.request;
-  if (req.method !== 'GET') return;
   const url = new URL(req.url);
-
-  // Свои файлы: сначала сеть (чтобы обновления приходили сразу), без сети — из кэша
-  if (url.origin === location.origin) {
-    e.respondWith(
-      fetch(req)
-        .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(req, copy));
-          return res;
-        })
-        .catch(() => caches.match(req, { ignoreSearch: true }).then((r) => r || caches.match('index.html')))
-    );
-    return;
-  }
-
-  // Библиотеки Firebase с gstatic: из кэша, чтобы приложение открывалось офлайн
-  if (url.hostname === 'www.gstatic.com') {
-    e.respondWith(
-      caches.match(req).then((hit) => hit || fetch(req).then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(req, copy));
+  if (req.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) return;
+  // Сначала сеть (чтобы обновления приходили сразу), без сети — из кэша
+  e.respondWith(
+    fetch(req)
+      .then((res) => {
+        if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
         return res;
-      }))
-    );
-  }
+      })
+      .catch(() => caches.match(req, { ignoreSearch: true }).then((r) => r || caches.match('index.html')))
+  );
 });
 
-// ---- Push ----
-try {
-  const cfg = self.FIREBASE_CONFIG || {};
-  if (cfg.apiKey && !cfg.apiKey.startsWith('ВСТАВЬТЕ')) {
-    firebase.initializeApp(cfg);
-    firebase.messaging().onBackgroundMessage((payload) => {
-      const d = payload.data || {};
-      return self.registration.showNotification(d.title || 'Склад', {
-        body: d.body || '',
-        icon: 'icons/icon-192.png',
-        badge: 'icons/icon-192.png',
-        tag: d.tag || undefined,
-        data: { url: './' },
-      });
-    });
-  }
-} catch (err) {
-  console.warn('FCM', err);
-}
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch { d = { body: e.data?.text() }; }
+  const title = d.title || 'Склад';
+  e.waitUntil(Promise.all([
+    self.registration.showNotification(title, {
+      body: d.body || '',
+      icon: 'icons/icon-192.png',
+      badge: 'icons/icon-192.png',
+      tag: d.tag || undefined,
+      data: { url: './' },
+    }),
+    // открытое приложение сразу обновит данные
+    self.clients.matchAll({ type: 'window' }).then((list) => list.forEach((c) => c.postMessage({ type: 'push', title, body: d.body || '' }))),
+  ]));
+});
 
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();

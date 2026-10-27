@@ -5,7 +5,6 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
-  external_node_modules = ["firebase-admin"]
 
 # service worker всегда свежий, чтобы обновления доходили до телефонов
 [[headers]]

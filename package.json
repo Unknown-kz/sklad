@@ -4,6 +4,7 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "dependencies": {
-    "firebase-admin": "^13.0.0"
+    "@netlify/blobs": "^11.1.6",
+    "web-push": "^3.6.7"
   }
 }
